@@ -583,7 +583,7 @@ pub static OPS: &[Op] = &[
             &["CodigoUc", "Titularidade"],
             false,
             R,
-            "Invoices by year. Titularidade: 1 holder, 2 non-holder, 3 linked.",
+            "Invoices by year. Always pass Ano: without it the portal returned an empty list. Titularidade: 1 holder, 2 non-holder, 3 linked.",
         ),
         &["Ano"],
     ),
