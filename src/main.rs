@@ -66,19 +66,33 @@ struct Conn {
     base_url: String,
     store_dir: Option<PathBuf>,
 }
+/// Another process may hold the store lock (a cron run, a second agent call). Wait for it, bounded.
+fn open_store(dir: &PathBuf) -> Result<Store> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match Store::open(dir) {
+            Err(Error::Validation(m))
+                if m.contains("store is busy") && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            other => return other,
+        }
+    }
+}
 impl Conn {
     fn client(&self) -> Result<Client> {
         if self.offline {
             return Client::offline(&self.base_url);
         }
         if let Some(dir) = &self.store_dir {
-            Client::from_store(&self.base_url, Store::open(dir)?)
+            Client::from_store(&self.base_url, open_store(dir)?)
         } else {
             Client::new(&self.base_url)
         }
     }
     fn store(&self) -> Result<Store> {
-        Store::open(
+        open_store(
             self.store_dir
                 .as_ref()
                 .ok_or(Error::Validation("--store-dir is required"))?,

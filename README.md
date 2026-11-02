@@ -188,6 +188,17 @@ cooperalianca check-new-bills --uc 123 --state ./open-invoices.jsonl --update-st
 the Cooperalianca Agência Virtual. The base URL contains no credentials.
 HTTPS is required except for loopback tests.
 
+Some portal rejections are normal answers rather than failures. The portal
+reports "no cut-off notices" as an error, so `open-invoice-warnings` and
+`list-removed-units` return `[]` for it. Every other rejection of a read or of
+an ordinary write is an `api` error that carries the portal's own message;
+operations whose body holds a password (`register-user`, `reset-password`) never
+show it. A few portal operations need a Google reCAPTCHA token (`unmapped`
+lists them); the SDK does not try to get around that.
+
+Several commands may run at once, for example a cron job and an agent call:
+the CLI waits up to 60 seconds for the store lock instead of failing.
+
 Login handling, session token endpoints, third-party sign-in, two-factor
 codes, and privacy-policy acceptance are not tools; `cooperalianca unmapped`
 lists them with the reason. `pay_bill` and other payment flows are not part of

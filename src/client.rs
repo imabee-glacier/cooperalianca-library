@@ -1,4 +1,4 @@
-use crate::catalog::{Method as Verb, Op, Out};
+use crate::catalog::{self, Method as Verb, Op, Out};
 use crate::{Credentials, Error, Result, Store};
 use reqwest::{Method, blocking::Response};
 use serde_json::Value;
@@ -236,15 +236,24 @@ impl Client {
         Ok(())
     }
     /// Decodes the `{Success, Content, Message}` envelope. Only `Content` is returned.
-    fn decode(status: u16, bytes: &[u8]) -> Result<Value> {
+    /// `detail` includes the portal's own `Message` in rejections. Login and password-bearing
+    /// operations never ask for it, in case a message echoes what was sent.
+    fn decode(status: u16, bytes: &[u8], detail: bool) -> Result<Value> {
         if matches!(status, 401 | 403) {
             return Err(Error::Unauthenticated);
         }
         let env: Option<Value> = serde_json::from_slice(bytes).ok();
+        let reason = |v: &Value| {
+            if detail {
+                portal_message(v)
+            } else {
+                String::new()
+            }
+        };
         if !(200..300).contains(&status) {
             return Err(match env {
                 Some(v) if v.get("Success") == Some(&Value::Bool(false)) && status == 400 => {
-                    Error::Api
+                    Error::Api(reason(&v))
                 }
                 _ => Error::Http(status),
             });
@@ -252,7 +261,7 @@ impl Client {
         let env = env.ok_or(Error::Parse)?;
         match env.get("Success") {
             Some(Value::Bool(true)) => {}
-            Some(Value::Bool(false)) => return Err(Error::Api),
+            Some(Value::Bool(false)) => return Err(Error::Api(reason(&env))),
             _ => return Err(Error::Parse),
         }
         env.get("Content").cloned().ok_or(Error::Parse)
@@ -295,10 +304,10 @@ impl Client {
         let u = self.api_url("Auth")?;
         self.token = None;
         let (status, bytes) = self.send(Method::POST, u, Some(&body), LIMIT)?;
-        let content = match Self::decode(status, &bytes) {
+        let content = match Self::decode(status, &bytes, false) {
             Ok(c) => c,
             // Wrong credentials, a locked account, and a rejected request all end the attempt.
-            Err(Error::Api | Error::Unauthenticated) => return Err(Error::Unauthenticated),
+            Err(Error::Api(_) | Error::Unauthenticated) => return Err(Error::Unauthenticated),
             Err(e) => return Err(e),
         };
         if content.get("PossuiAuthDoisFatores") == Some(&Value::Bool(true)) {
@@ -356,7 +365,9 @@ impl Client {
             let (status, bytes) =
                 self.send(method.clone(), u.clone(), payload.as_deref(), limit)?;
             let result = match op.out {
-                Out::Json => Self::decode(status, &bytes).map(Output::Json),
+                Out::Json => {
+                    Self::decode(status, &bytes, catalog::reports_message(op)).map(Output::Json)
+                }
                 Out::Pdf => {
                     if matches!(status, 401 | 403) {
                         Err(Error::Unauthenticated)
@@ -371,6 +382,9 @@ impl Client {
             };
             match result {
                 // One renewal per call. A 401 means the request was rejected, not executed.
+                Err(Error::Api(m)) if !op.empty_on.is_empty() && m.starts_with(op.empty_on) => {
+                    return Ok(Output::Json(Value::Array(Vec::new())));
+                }
                 Err(Error::Unauthenticated) if !renewed && self.has_credentials() => {
                     renewed = true;
                     self.authenticate()?;
@@ -379,6 +393,19 @@ impl Client {
             }
         }
     }
+}
+/// The portal's `Message`, single-line and bounded, or "no detail".
+fn portal_message(env: &Value) -> String {
+    let m: String = env
+        .get("Message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(300)
+        .collect();
+    let m = m.split_whitespace().collect::<Vec<_>>().join(" ");
+    if m.is_empty() { "no detail".into() } else { m }
 }
 fn config_value(text: &str, key: &str) -> Option<String> {
     let rest = &text[text.find(key)? + key.len()..];
