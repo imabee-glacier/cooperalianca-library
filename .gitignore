@@ -1,0 +1,15 @@
+# Secrets and persistent local state must stay outside the repository.
+credentials.key
+credentials.enc
+session.enc
+store.lock
+*.key
+*.enc
+cooperalianca-pass*
+*.tmp-pass
+.env
+.env.*
+*.jsonl
+!testdata/*.jsonl
+/target/
+/cooperalianca
