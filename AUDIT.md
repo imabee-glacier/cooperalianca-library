@@ -44,6 +44,11 @@ One enrolled account (the maintainer's own) was used on 2026-11-02. Verified:
   operator has not configured its backend; `privacy_policy_url` says the operator
   has not configured the policy URL; `profile_without_unit`, `payment_link`
   and `generation_swap_data` returned generic errors for this account.
+- `list_invoices_by_year` returns an empty list when `Ano` is omitted, so always pass
+  it. For the verified account the portal lists two years from `invoice_years` but
+  returns invoices only for the current one, under every `Titularidade`; the
+  60-month history covers the same months. That gap is the portal's data, not a
+  client fault.
 - `list_linked_units` returned an empty list for an account whose profile lists a
   unit, so use `profile` to find unit codes.
 - `open_invoice_warnings` was rejected by the portal (`api`) for that account; the
