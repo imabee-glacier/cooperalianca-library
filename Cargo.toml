@@ -1,0 +1,40 @@
+[package]
+name = "cooperalianca-library"
+version = "0.1.0"
+edition = "2024"
+description = "Direct HTTP Cooperalianca Agência Virtual SDK with encrypted persistent sessions"
+rust-version = "1.88"
+include = ["src/**", "build.rs", "Cargo.toml", "Cargo.lock", "README.md", "AUDIT.md", "AGENTS.md"]
+
+[lib]
+name = "cooperalianca"
+
+[[bin]]
+name = "cooperalianca"
+path = "src/main.rs"
+
+[dependencies]
+aes-gcm = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
+libc = "0.2"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "rustls-tls-native-roots", "socks", "json"] }
+rpassword = "7"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+url = "2"
+zeroize = { version = "1", features = ["derive"] }
+workspace-hack = { version = "0.1", path = "workspace-hack" }
+
+[dev-dependencies]
+jsonschema = { version = "0.60", default-features = false, features = ["arbitrary-precision"] }
+tiny_http = "0.12"
+
+[workspace]
+resolver = "3"
+members = [".","workspace-hack"]

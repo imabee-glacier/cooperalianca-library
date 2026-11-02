@@ -1,0 +1,885 @@
+name: CI
+
+# Purely event-driven: triggered only by pull requests, pushes to main and the merge queue.
+# No paths-ignore: the workflow always starts so ci-ok always reports.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+# Stale PR runs are waste. Main (and the merge queue) always run to completion:
+# versions come from git tags, so a later main run releases whatever a replaced
+# pending run would have.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: "0"
+  # Single source of scope. Adding a component or target means editing only this block.
+  # Profile settings and linkers live in .cargo/config.toml; rustflags are never overridden here.
+  CONFIG: |
+    {
+      "COMPONENTS": [
+        {
+          "name": "cooperalianca-library",
+          "paths": ["src/**", "tests/**", "build.rs", "Cargo.toml"],
+          "crates": ["cooperalianca-library"],
+          "targets": ["x86_64-unknown-linux-gnu"],
+          "versioned": true,
+          "publish": false
+        }
+      ],
+      "TARGETS": [
+        {
+          "name": "linux-x64",
+          "triple": "x86_64-unknown-linux-gnu",
+          "runner": "ubuntu-latest",
+          "method": "native",
+          "tier": 1,
+          "tested": true,
+          "paths": []
+        }
+      ]
+    }
+
+jobs:
+  # ---------------------------------------------------------------- changes
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.scope.outputs.skip }}
+      deps_changed: ${{ steps.scope.outputs.deps_changed }}
+      components: ${{ steps.scope.outputs.components }}
+      targets: ${{ steps.scope.outputs.targets }}
+      pargs: ${{ steps.scope.outputs.pargs }}
+      check_matrix: ${{ steps.scope.outputs.check_matrix }}
+      test_matrix: ${{ steps.scope.outputs.test_matrix }}
+      warm_matrix: ${{ steps.scope.outputs.warm_matrix }}
+      has_check: ${{ steps.scope.outputs.has_check }}
+      has_test: ${{ steps.scope.outputs.has_test }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # history and tags are needed for the diff
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Validate config and compute scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MQ_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          # The workspace-hack package is read from .config/hakari.toml and never appears in a -p list.
+          hack=$(awk -F= '/^[[:space:]]*hakari-package[[:space:]]*=/ {sub(/#.*/,"",$2); gsub(/[[:space:]"\047]/,"",$2); print $2}' .config/hakari.toml)
+          [ -n "$hack" ] || { echo "::error::hakari-package missing in .config/hakari.toml"; exit 1; }
+          meta="$RUNNER_TEMP/metadata.json"
+          cargo metadata --locked --format-version 1 > "$meta"
+
+          members=$(jq -c '[.workspace_members as $w | .packages[] | select(.id as $i | $w | index($i)) | .name]' "$meta")
+          jq -e --argjson members "$members" --arg hack "$hack" '
+            ($members | index($hack)) != null
+            and ([.TARGETS[].triple] | length == (unique | length))
+            and ([.COMPONENTS[].name] | length == (unique | length))
+            and ([.TARGETS[] | select(.tier == 1)] | length == 1)
+            and all(.TARGETS[];
+                  (.triple | test("^[A-Za-z0-9][A-Za-z0-9_.-]+$"))
+                  and (.method == "native" or .method == "zigbuild")
+                  and (.tier == 1 or .tier == 2)
+                  and (.tier != 1 or (.triple == "x86_64-unknown-linux-gnu" and .method == "native" and .tested == true))
+                  and (.method != "zigbuild" or (.tier == 2 and .tested == false)))
+            and all(.COMPONENTS[];
+                  (.name | test("^[A-Za-z0-9][A-Za-z0-9_-]*$"))
+                  and (.paths | length > 0) and (.crates | length > 0) and (.targets | length > 0)
+                  and ((.publish | not) or .versioned)
+                  and all(.crates[]; . as $c | $c != $hack and ($members | index($c)) != null)
+                  and all(.targets[]; . as $t | any($config_targets[]; . == $t)))
+          ' --argjson config_targets "$(jq -c '[.TARGETS[].triple]' <<<"$CONFIG")" <<<"$CONFIG" > /dev/null \
+            || { echo "::error::Invalid CONFIG: unknown crate/target, duplicate name, or tier rule broken"; exit 1; }
+
+          # Diff base per event. An unusable base (new branch, force push) means everything is affected.
+          forced=false
+          case "$EVENT_NAME" in
+            pull_request) base=$PR_BASE_SHA; diff_args=("$PR_BASE_SHA...$PR_HEAD_SHA") ;;
+            merge_group)  base=$MQ_BASE_SHA; diff_args=("$MQ_BASE_SHA" "$GITHUB_SHA") ;;
+            push)         base=$PUSH_BEFORE; diff_args=("$PUSH_BEFORE" "$GITHUB_SHA") ;;
+          esac
+          changed="$RUNNER_TEMP/changed.z"
+          if [[ ! $base =~ ^[0-9a-f]{40,64}$ || $base =~ ^0+$ ]] \
+            || ! git cat-file -e "$base^{commit}" 2> /dev/null \
+            || ! git diff --name-only --no-renames -z "${diff_args[@]}" > "$changed"; then
+            forced=true
+            : > "$changed"
+            echo "::warning::No usable diff base; treating every component as affected"
+          fi
+          jq -Rs 'split("\u0000") | map(select(length > 0))' < "$changed" > "$RUNNER_TEMP/changed.json"
+
+          read -r -d '' prog <<'JQ' || true
+          # Translate a path glob (** crosses directories, * does not) into an anchored regex.
+          def g2r:
+            gsub("(?<c>[.+^$(){}|\\[\\]\\\\])"; "\\" + .c)
+            | gsub("\\*\\*/"; "\u0001") | gsub("\\*\\*"; "\u0002")
+            | gsub("\\*"; "[^/]*") | gsub("\\?"; "[^/]")
+            | gsub("\u0001"; "(.*/)?") | gsub("\u0002"; ".*")
+            | "^" + . + "$";
+          def hit($globs; $files): any($files[]; . as $f | any($globs[]; . as $g | $f | test($g | g2r)));
+          def docs: test("^docs/|(^|/)[^/]*\\.md$|^LICENSE[^/]*$|^\\.github/ISSUE_TEMPLATE/");
+          . as $meta
+          | $changed[0] as $files
+          | $meta.workspace_members as $wm
+          | [$meta.packages[] | select(.id as $i | $wm | index($i)) | select(.name != $hack)] as $members
+          | (first($meta.packages[] | select(.name == $hack)) | .manifest_path | ltrimstr($root)) as $hackpath
+          | $config.COMPONENTS as $comps
+          | ($files | length) as $n
+          | ($n > 0 and ($forced | not) and all($files[]; docs)) as $skip
+          | ($forced or any($files[]; test("(^|/)Cargo\\.toml$|^Cargo\\.lock$|^\\.config/hakari\\.toml$"))) as $deps
+          # Components never released on their own (versioned=false) are the shared crates.
+          | [$comps[] | select(.versioned | not) | .paths[]] as $sharedglobs
+          | ($forced
+             or any($files[]; . == "Cargo.lock" or . == "rust-toolchain.toml" or . == $hackpath
+                    or . == ".config/hakari.toml" or . == ".cargo/config.toml"
+                    or . == ".config/nextest.toml" or . == ".github/workflows/ci.yml")
+             or hit($sharedglobs; $files)) as $all
+          | (if $all then $comps else [$comps[] | select(hit(.paths; $files))] end) as $direct
+          | ([$direct[].crates[]] | unique) as $seedcrates
+          | ([$members[] | select(.name as $nm | $seedcrates | index($nm)) | .id] | unique) as $seedids
+          # Close over reverse dependencies (normal, build and dev edges).
+          | def expand($ids):
+              ([$meta.resolve.nodes[] | select(any(.deps[]; .pkg as $p | $ids | index($p))) | .id] + $ids | unique) as $next
+              | if $next == $ids then $ids else expand($next) end;
+            expand($seedids) as $ids
+          | [$members[] | select(.id as $i | $ids | index($i)) | .name] as $affcrates
+          | [$comps[] | select(any(.crates[]; . as $c | $affcrates | index($c)))] as $affcomps
+          | [$config.TARGETS[] | select(.triple as $t | any($affcomps[]; .targets | index($t)))] as $afftargets
+          | [$config.TARGETS[] | select(.triple as $t | any($comps[]; .targets | index($t)))] as $shipped
+          | def pargs($t):
+              [$affcomps[] | select(.targets | index($t)) | .crates[] | select(. as $c | $affcrates | index($c))]
+              | unique | map("-p " + .) | join(" ");
+            def allp($t):
+              [$comps[] | select(.targets | index($t)) | .crates[] | select(. != $hack)]
+              | unique | map("-p " + .) | join(" ");
+            def leg($t): {name: $t.name, triple: $t.triple, runner: $t.runner, method: $t.method,
+                          tier: $t.tier, tested: $t.tested, pargs: pargs($t.triple)};
+          # check-targets: Tier 2 only (clippy covers Tier 1). PR needs a matching target path.
+            (if $event == "pull_request" then [$afftargets[] | select(.tier == 2 and hit(.paths; $files))]
+             elif $event == "merge_group" then [$afftargets[] | select(.tier == 2)]
+             else [] end | map(leg(.))) as $check
+          # test: PR runs Tier 1; the merge queue adds every tested Tier 2 target.
+          | (if $event == "pull_request" then [$afftargets[] | select(.tier == 1)]
+             elif $event == "merge_group" then [$afftargets[] | select(.tier == 1 or .tested)]
+             else [] end | map(leg(.))) as $test
+          # warm-cache: all components, one leg per (target, kind) so every rust-cache key has one writer.
+          | ([$shipped[] | {name: .name, triple: .triple, runner: .runner, method: .method, kind: "check", pargs: allp(.triple)}]
+             + [$shipped[] | select(.tested) | {name: .name, triple: .triple, runner: .runner, method: .method, kind: "test", pargs: allp(.triple)}]) as $warm
+          | {
+              skip: $skip,
+              deps_changed: $deps,
+              components: [$affcomps[].name],
+              targets: [$afftargets[].triple],
+              pargs: ($affcrates | map("-p " + .) | join(" ")),
+              check_matrix: {include: $check},
+              test_matrix: {include: $test},
+              warm_matrix: {include: $warm},
+              has_check: (($check | length) > 0),
+              has_test: (($test | length) > 0)
+            }
+          JQ
+          result=$(jq --argjson config "$CONFIG" --slurpfile changed "$RUNNER_TEMP/changed.json" \
+            --arg hack "$hack" --arg root "$GITHUB_WORKSPACE/" --arg event "$EVENT_NAME" \
+            --argjson forced "$forced" "$prog" "$meta")
+          jq -r 'to_entries[] | "\(.key)=\(.value | if type == "string" then . else tojson end)"' <<<"$result" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Scope"
+            echo "- skip: $(jq -r .skip <<<"$result"), deps_changed: $(jq -r .deps_changed <<<"$result")"
+            echo "- affected components: $(jq -c .components <<<"$result")"
+            echo "- affected targets: $(jq -c .targets <<<"$result")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ gates
+  gates:
+    needs: changes
+    if: needs.changes.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the PR commit range is linted
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install linker tools if configured
+        env:
+          TRIPLE: x86_64-unknown-linux-gnu
+        run: |
+          if awk -v t="$TRIPLE" '
+            /^\[/ { active = index($0, "target." t "]") || index($0, "target.\"" t "\"]") || index($0, "target." t ".") }
+            active && /linker[[:space:]]*=[[:space:]]*"clang"/ { found = 1 }
+            END { exit !found }' .cargo/config.toml; then
+            sudo apt-get install -y clang lld
+          fi
+      - name: Install cargo-deny
+        if: needs.changes.outputs.deps_changed == 'true'
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-deny
+          fallback: none
+      # cargo-hakari has no install-action manifest, so this uses the cargo-binstall fallback
+      # (prebuilt binary, pinned version), never `cargo install`.
+      - name: Install cargo-hakari
+        if: needs.changes.outputs.deps_changed == 'true'
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-hakari@0.9.39
+      - name: Lint commit messages
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # GitHub silently drops runs for these strings, leaving required checks pending forever.
+          subject_re='^(feat|fix|perf|docs|chore|ci|test|style|refactor|build|revert)(\([^)]+\))?!?: .+'
+          skip_re='\[(skip ci|ci skip|no ci|skip actions|actions skip)\]|skip-checks:'
+          bad=0
+          while IFS= read -r sha; do
+            subject=$(git show -s --format=%s "$sha")
+            if ! grep -Eq "$subject_re" <<<"$subject" || git show -s --format=%B "$sha" | grep -Eiq "$skip_re"; then
+              echo "::error::$(git rev-parse --short "$sha") $subject"
+              bad=1
+            fi
+          done < <(git rev-list "$PR_BASE_SHA..$PR_HEAD_SHA")
+          exit "$bad"
+      - name: Format
+        run: cargo --locked fmt --all --check
+      - name: Hakari
+        if: needs.changes.outputs.deps_changed == 'true'
+        run: |
+          if ! cargo --locked hakari generate --diff || ! cargo --locked hakari manage-deps --dry-run; then
+            echo "Fix: cargo hakari generate && cargo hakari manage-deps"
+            exit 1
+          fi
+      - name: Deny
+        if: needs.changes.outputs.deps_changed == 'true'
+        run: cargo deny --locked --workspace check
+      # Hits because: shared-key x86_64-unknown-linux-gnu-lint plus the automatic hash of manifests,
+      # Cargo.lock and toolchain files matches the cache this very job saves on main with --workspace.
+      # PRs and the merge queue only restore it (save-if), falling back to main's entry.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        id: cache
+        with:
+          shared-key: x86_64-unknown-linux-gnu-lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Report cache hit
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: echo "cache-hit=$CACHE_HIT"
+      - name: Clippy (also the Tier 1 compile check)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PARGS: ${{ needs.changes.outputs.pargs }}
+        run: |
+          # On main the whole workspace is linted so the lint cache stays warm for every PR.
+          if [ "$EVENT_NAME" = push ]; then
+            scope=(--workspace)
+          elif [ -n "$PARGS" ]; then
+            read -ra scope <<<"$PARGS"
+          else
+            echo "No affected crates: clippy skipped"
+            exit 0
+          fi
+          cargo clippy --all-targets --locked "${scope[@]}" -- -D warnings
+
+  # ---------------------------------------------------------- check-targets
+  check-targets:
+    needs: [changes, gates]
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+      && needs.changes.outputs.skip == 'false'
+      && needs.changes.outputs.has_check == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: true
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.changes.outputs.check_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install linker tools if configured
+        if: runner.os == 'Linux'
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          # The target's C library (e.g. libc6-dev-arm64-cross on Ubuntu) is needed when cross-linking.
+          if awk -v t="$TRIPLE" '
+            /^\[/ { active = index($0, "target." t "]") || index($0, "target.\"" t "\"]") || index($0, "target." t ".") }
+            active && /linker[[:space:]]*=[[:space:]]*"clang"/ { found = 1 }
+            END { exit !found }' .cargo/config.toml; then
+            sudo apt-get install -y clang lld
+          fi
+      # Hits because: <triple>-check is written only by warm-cache's check leg for this triple on main
+      # (one writer per key); this job only restores it, and the key hashes manifests, lockfile and toolchain.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        id: cache
+        with:
+          shared-key: ${{ matrix.triple }}-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Report cache hit
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: echo "cache-hit=$CACHE_HIT"
+      - name: Check
+        env:
+          TRIPLE: ${{ matrix.triple }}
+          PARGS: ${{ matrix.pargs }}
+        run: |
+          read -ra args <<<"$PARGS"
+          cargo check --target "$TRIPLE" --locked "${args[@]}"
+
+  # ------------------------------------------------------------------- test
+  test:
+    needs: [changes, gates]
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+      && needs.changes.outputs.skip == 'false'
+      && needs.changes.outputs.has_test == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.changes.outputs.test_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install linker tools if configured
+        if: runner.os == 'Linux'
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          if awk -v t="$TRIPLE" '
+            /^\[/ { active = index($0, "target." t "]") || index($0, "target.\"" t "\"]") || index($0, "target." t ".") }
+            active && /linker[[:space:]]*=[[:space:]]*"clang"/ { found = 1 }
+            END { exit !found }' .cargo/config.toml; then
+            sudo apt-get install -y clang lld
+          fi
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-nextest
+          fallback: none
+      # Hits because: <triple>-test is written only by warm-cache's test leg for this triple on main
+      # (one writer per key); this job only restores it, and the key hashes manifests, lockfile and toolchain.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        id: cache
+        with:
+          shared-key: ${{ matrix.triple }}-test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Report cache hit
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: echo "cache-hit=$CACHE_HIT"
+      - name: Test (native, no --target)
+        env:
+          PARGS: ${{ matrix.pargs }}
+        run: |
+          read -ra args <<<"$PARGS"
+          cargo nextest run --locked --profile gate "${args[@]}"
+      - name: Doc tests (Tier 1, merge queue)
+        if: matrix.tier == 1 && github.event_name == 'merge_group'
+        run: cargo test --doc --locked --workspace
+
+  # ------------------------------------------------------------------- msrv
+  msrv:
+    needs: [changes, gates]
+    if: >-
+      (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+      && needs.changes.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install linker tools if configured
+        env:
+          TRIPLE: x86_64-unknown-linux-gnu
+        run: |
+          if awk -v t="$TRIPLE" '
+            /^\[/ { active = index($0, "target." t "]") || index($0, "target.\"" t "\"]") || index($0, "target." t ".") }
+            active && /linker[[:space:]]*=[[:space:]]*"clang"/ { found = 1 }
+            END { exit !found }' .cargo/config.toml; then
+            sudo apt-get install -y clang lld
+          fi
+      - name: Find MSRV
+        id: msrv
+        run: |
+          # M is the highest rust-version among workspace members.
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '
+            [.workspace_members as $w | .packages[] | select(.id as $i | $w | index($i)) | .rust_version | select(. != null)]
+            | sort_by(split(".") | map(tonumber)) | last // empty')
+          if [ -z "$version" ]; then
+            echo "MSRV: not configured"
+          else
+            echo "MSRV: $version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install MSRV toolchain
+        if: steps.msrv.outputs.version != ''
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          rustup toolchain install "$MSRV" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$MSRV" >> "$GITHUB_ENV"
+      # Hits because: x86_64-unknown-linux-gnu-msrv is saved by this job on main (all components,
+      # --workspace) and keyed on the MSRV rustc, so merge-queue runs restore the same artifacts.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        id: cache
+        if: steps.msrv.outputs.version != ''
+        with:
+          shared-key: x86_64-unknown-linux-gnu-msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Report cache hit
+        if: steps.msrv.outputs.version != ''
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: echo "cache-hit=$CACHE_HIT"
+      - name: Check at MSRV
+        if: steps.msrv.outputs.version != ''
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: cargo "+$MSRV" check --workspace --locked
+
+  # ------------------------------------------------------------- warm-cache
+  # Saves the caches that PR and merge-queue runs restore. Tests already passed in the merge
+  # queue, so tests are only compiled here, never run. One leg per (target, kind): every
+  # rust-cache key has exactly one writer. x86_64-unknown-linux-gnu-check has no reader
+  # (Tier 1 is excluded from check-targets) but the spec asks for a check on every target.
+  warm-cache:
+    needs: [changes, gates]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.changes.outputs.skip == 'false'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.changes.outputs.warm_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install linker tools if configured
+        if: runner.os == 'Linux'
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          if awk -v t="$TRIPLE" '
+            /^\[/ { active = index($0, "target." t "]") || index($0, "target.\"" t "\"]") || index($0, "target." t ".") }
+            active && /linker[[:space:]]*=[[:space:]]*"clang"/ { found = 1 }
+            END { exit !found }' .cargo/config.toml; then
+            sudo apt-get install -y clang lld
+          fi
+      - name: Install cargo-nextest
+        if: matrix.kind == 'test'
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-nextest
+          fallback: none
+      # Hits because: this job is the only writer of <triple>-<kind> (check or test) on main, and
+      # save-if limits saving to main; the next push restores and refreshes its own previous entry.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        id: cache
+        with:
+          shared-key: ${{ matrix.triple }}-${{ matrix.kind }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Report cache hit
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: echo "cache-hit=$CACHE_HIT"
+      - name: Warm
+        env:
+          KIND: ${{ matrix.kind }}
+          TRIPLE: ${{ matrix.triple }}
+          PARGS: ${{ matrix.pargs }}
+        run: |
+          read -ra args <<<"$PARGS"
+          if [ "$KIND" = check ]; then
+            cargo check --target "$TRIPLE" --locked "${args[@]}"
+          else
+            cargo nextest run --no-run --locked "${args[@]}"
+          fi
+
+  # ---------------------------------------------------------------- version
+  # Versions come only from git tags named <component>-vX.Y.Z; nothing is committed to main.
+  version:
+    needs: [changes, gates]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.changes.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      releases: ${{ steps.plan.outputs.releases }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # history and tags
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Plan releases
+        id: plan
+        run: |
+          # feat = minor; fix, perf = patch; "!" or a BREAKING CHANGE footer = major (any type);
+          # docs, chore, ci, test, style, refactor, build, revert = no release on their own.
+          # Commits are read per component, limited to its paths plus the shared (versioned=false) paths it depends on.
+          set -euo pipefail
+          sha=$GITHUB_SHA
+          meta=$(cargo metadata --locked --no-deps --format-version 1)
+          releases='[]'
+          subject_re='^(feat|fix|perf|docs|chore|ci|test|style|refactor|build|revert)(\([^)]+\))?(!)?: (.+)$'
+          while IFS= read -r comp; do
+            name=$(jq -r .name <<<"$comp")
+            crate0=$(jq -r '.crates[0]' <<<"$comp")
+            tag_re="^${name}-v[0-9]+\.[0-9]+\.[0-9]+\$"
+            mapfile -t tags < <(git tag --list "${name}-v*" --merged "$sha" --sort=-v:refname | grep -E "$tag_re" || true)
+            at_head=$(git tag --points-at "$sha" --list "${name}-v*" | grep -E "$tag_re" | sort -V | tail -n 1 || true)
+            # Own paths plus the paths of shared (versioned=false) components this component reaches
+            # through workspace dependencies, so unrelated shared changes do not release it.
+            mapfile -t pathspecs < <(jq -r --arg n "$name" --argjson meta "$meta" '
+              . as $cfg
+              | (first($cfg.COMPONENTS[] | select(.name == $n))) as $me
+              | def expand($set):
+                  ([$meta.packages[] | select(.name as $p | $set | index($p)) | .dependencies[].name] + $set | unique) as $next
+                  | if $next == $set then $set else expand($next) end;
+                expand($me.crates | unique) as $reach
+              | [$cfg.COMPONENTS[]
+                 | select(.name == $n or ((.versioned | not) and any(.crates[]; . as $c | $reach | index($c))))]
+              | map(.paths[]) | unique | .[] | ":(glob)" + .' <<<"$CONFIG")
+
+            if [ -n "$at_head" ]; then
+              # Re-run: the tag already exists at this commit, so reuse it and continue.
+              tag=$at_head
+              prev=$(printf '%s\n' "${tags[@]}" | grep -vxF "$tag" | head -n 1 || true)
+            else
+              tag=''
+              prev=${tags[0]:-}
+            fi
+
+            level=0; n_break=(); n_feat=(); n_fix=(); n_perf=()
+            while IFS= read -r -d '' rec || [ -n "$rec" ]; do
+              rest=${rec#*$'\x1f'}
+              short=${rec%%$'\x1f'*}
+              subject=${rest%%$'\x1f'*}
+              body=${rest#*$'\x1f'}
+              [[ $subject =~ $subject_re ]] || continue
+              type=${BASH_REMATCH[1]}; bang=${BASH_REMATCH[3]}; desc=${BASH_REMATCH[4]}
+              line="$desc ($short)"
+              if [ -n "$bang" ] || [[ $body =~ (^|$'\n')BREAKING[\ -]CHANGE: ]]; then
+                n_break+=("$line"); [ "$level" -ge 3 ] || level=3
+              elif [ "$type" = feat ]; then
+                n_feat+=("$line"); [ "$level" -ge 2 ] || level=2
+              elif [ "$type" = fix ]; then
+                n_fix+=("$line"); [ "$level" -ge 1 ] || level=1
+              elif [ "$type" = perf ]; then
+                n_perf+=("$line"); [ "$level" -ge 1 ] || level=1
+              fi
+            done < <(git log -z --format='%h%x1f%s%x1f%b' "${prev:+$prev..}$sha" -- "${pathspecs[@]}")
+
+            if [ -z "$tag" ]; then
+              if [ -z "$prev" ]; then
+                # No tag yet: the first run releases the version in the component's Cargo.toml as is.
+                base=$(jq -r --arg c "$crate0" '.packages[] | select(.name == $c) | .version' <<<"$meta")
+                level=0
+              elif [ "$level" -eq 0 ]; then
+                echo "$name: no releasable commits since $prev"
+                continue
+              else
+                base=${prev#"${name}-v"}
+              fi
+              [[ $base =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$name: base version '$base' is not X.Y.Z"; exit 1; }
+              IFS=. read -r maj min pat <<<"$base"
+              case $level in
+                3) maj=$((maj + 1)); min=0; pat=0 ;;
+                2) min=$((min + 1)); pat=0 ;;
+                1) pat=$((pat + 1)) ;;
+              esac
+              tag="${name}-v${maj}.${min}.${pat}"
+              if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+                echo "::warning::$tag already exists at another commit; not releasing $name"
+                continue
+              fi
+            fi
+            version=${tag#"${name}-v"}
+
+            notes=''
+            section() {
+              local title=$1 lines
+              shift
+              [ "$#" -gt 0 ] || return 0
+              printf -v lines -- '- %s\n' "$@"
+              notes+="### $title"$'\n'"$lines"$'\n'
+            }
+            section "Breaking changes" "${n_break[@]}"
+            section "Features" "${n_feat[@]}"
+            section "Fixes" "${n_fix[@]}"
+            section "Performance" "${n_perf[@]}"
+            [ -n "$notes" ] || notes="Initial release."
+
+            echo "$name: $tag (previous: ${prev:-none})"
+            releases=$(jq -c --argjson comp "$comp" --arg version "$version" --arg tag "$tag" --arg prev "$prev" --arg notes "$notes" '
+              . + [{name: $comp.name, crates: $comp.crates, publish: $comp.publish, targets: $comp.targets,
+                    version: $version, tag: $tag, prev_tag: $prev,
+                    envvar: ("CI_VERSION_" + ($comp.name | ascii_upcase | gsub("-"; "_"))), notes: $notes}]' <<<"$releases")
+          done < <(jq -c '.COMPONENTS[] | select(.versioned)' <<<"$CONFIG")
+
+          # Release matrix: per target, the released components and their versions.
+          matrix=$(jq -c --argjson config "$CONFIG" '
+            . as $rel
+            | {include: [$config.TARGETS[] | . as $t
+                | ([$rel[] | select(.targets | index($t.triple))]) as $rs
+                | select($rs | length > 0)
+                | {name: $t.name, triple: $t.triple, method: $t.method,
+                   runner: (if $t.method == "zigbuild" then "ubuntu-latest" else $t.runner end),
+                   pargs: ([$rs[].crates[]] | unique | map("-p " + .) | join(" ")),
+                   versions: ($rs | map({(.envvar): .version}) | add),
+                   components: ($rs | map({name: .name, version: .version}))}]}' <<<"$releases")
+          if [ "$(jq length <<<"$releases")" -eq 0 ]; then release=false; else release=true; fi
+          {
+            echo "release=$release"
+            echo "releases=$releases"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
+          echo "release=$release"
+
+  # ------------------------------------------------------------------ build
+  build:
+    needs: version
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.version.outputs.release == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.version.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install linker tools if configured
+        if: runner.os == 'Linux' && matrix.method == 'native'
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          if awk -v t="$TRIPLE" '
+            /^\[/ { active = index($0, "target." t "]") || index($0, "target.\"" t "\"]") || index($0, "target." t ".") }
+            active && /linker[[:space:]]*=[[:space:]]*"clang"/ { found = 1 }
+            END { exit !found }' .cargo/config.toml; then
+            sudo apt-get install -y clang lld
+          fi
+      - name: Install cargo-zigbuild
+        if: matrix.method == 'zigbuild'
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-zigbuild
+          fallback: none
+      # zig is the linker for zigbuild targets; install-action has no zig manifest.
+      - name: Install zig
+        if: matrix.method == 'zigbuild'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+      # Hits because: <triple>-release is written only by this leg on main (one writer per key,
+      # save-if main) and restored by the next release build; CI_VERSION_* changes only rebuild the crate.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        id: cache
+        with:
+          shared-key: ${{ matrix.triple }}-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Report cache hit
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: echo "cache-hit=$CACHE_HIT"
+      - name: Build released components
+        env:
+          VERSIONS: ${{ toJSON(matrix.versions) }}
+          COMPONENTS: ${{ toJSON(matrix.components) }}
+          TRIPLE: ${{ matrix.triple }}
+          METHOD: ${{ matrix.method }}
+          PARGS: ${{ matrix.pargs }}
+        run: |
+          # build.rs reads CI_VERSION_<COMPONENT>; Cargo.toml is never edited.
+          while IFS= read -r kv; do
+            export "${kv?}"
+          done < <(jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$VERSIONS")
+          read -ra args <<<"$PARGS"
+          out="$RUNNER_TEMP/build.json"
+          if [ "$METHOD" = zigbuild ]; then
+            cargo zigbuild --release --locked --target "$TRIPLE" "${args[@]}" --message-format json-render-diagnostics > "$out"
+          else
+            cargo build --release --locked --target "$TRIPLE" "${args[@]}" --message-format json-render-diagnostics > "$out"
+          fi
+
+          meta="$RUNNER_TEMP/meta.json"
+          cargo metadata --locked --no-deps --format-version 1 > "$meta"
+          dist="$PWD/dist"
+          mkdir -p "$dist"
+          while IFS=$'\t' read -r comp version; do
+            stage=$(mktemp -d)
+            count=0
+            while IFS= read -r exe; do
+              cp "$exe" "$stage/"
+              count=$((count + 1))
+            done < <(jq -r --arg comp "$comp" --slurpfile meta "$meta" --argjson config "$CONFIG" '
+              select(.reason == "compiler-artifact" and .executable != null and (.target.kind | index("bin")))
+              | .package_id as $id
+              | select(any($meta[0].packages[]; .id == $id
+                  and (.name as $n | any($config.COMPONENTS[]; .name == $comp and (.crates | index($n))))))
+              | .executable' "$out" | sort -u)
+            if [ "$count" -eq 0 ]; then
+              echo "::warning::$comp has no binaries for $TRIPLE; nothing to attach"
+              continue
+            fi
+            archive="$comp-$version-$TRIPLE.tar.gz"
+            tar -C "$stage" -czf "$dist/$archive" .
+            (cd "$dist" && shasum -a 256 "$archive" > "$archive.sha256")
+          done < <(jq -r '.[] | [.name, .version] | @tsv' <<<"$COMPONENTS")
+          ls -l "$dist"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.triple }}
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------- release
+  # Tags and releases created with GITHUB_TOKEN do not trigger workflows, so there is no loop.
+  release:
+    needs: [version, build]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/dist # outside the checkout so cargo publish sees a clean tree
+      - name: Create tags and releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASES: ${{ needs.version.outputs.releases }}
+        run: |
+          # The tag is created by the API at the pushed commit (no git push, no stored credentials).
+          # Re-runs: an existing release only gets its assets replaced.
+          set -euo pipefail
+          shopt -s nullglob
+          dist="$RUNNER_TEMP/dist"
+          while IFS= read -r rel; do
+            name=$(jq -r .name <<<"$rel")
+            tag=$(jq -r .tag <<<"$rel")
+            version=$(jq -r .version <<<"$rel")
+            notes="$RUNNER_TEMP/notes-$name.md"
+            jq -r .notes <<<"$rel" > "$notes"
+            [ -s "$notes" ] || echo "Release $tag" > "$notes"
+            files=("$dist/$name-$version-"*.tar.gz "$dist/$name-$version-"*.sha256)
+            if gh release view "$tag" > /dev/null 2>&1; then
+              if [ "${#files[@]}" -gt 0 ]; then gh release upload "$tag" "${files[@]}" --clobber; fi
+            else
+              gh release create "$tag" "${files[@]}" --target "$GITHUB_SHA" --title "$name $version" --notes-file "$notes"
+            fi
+          done < <(jq -c '.[]' <<<"$RELEASES")
+      - name: Install pinned toolchain
+        if: contains(needs.version.outputs.releases, '"publish":true')
+        run: rustup show active-toolchain || rustup toolchain install
+      # Hits because: restores main's x86_64-unknown-linux-gnu-release entry written by the build leg;
+      # this job never saves (cargo publish verifies in its own target/package directory).
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        id: cache
+        if: contains(needs.version.outputs.releases, '"publish":true')
+        with:
+          shared-key: x86_64-unknown-linux-gnu-release
+          save-if: false
+      - name: Report cache hit
+        if: contains(needs.version.outputs.releases, '"publish":true')
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: echo "cache-hit=$CACHE_HIT"
+      - name: Publish to crates.io
+        if: contains(needs.version.outputs.releases, '"publish":true')
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASES: ${{ needs.version.outputs.releases }}
+        run: |
+          # The empty workspace-hack crate already on crates.io satisfies the path+version dependency.
+          # cargo publish cannot override the manifest version: publish only when Cargo.toml already
+          # equals the released version, and never re-publish a version crates.io already has.
+          set -euo pipefail
+          meta="$RUNNER_TEMP/publish-meta.json"
+          cargo metadata --locked --no-deps --format-version 1 > "$meta"
+          while IFS=$'\t' read -r crate want; do
+            have=$(jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version' "$meta")
+            if [ "$have" != "$want" ]; then
+              echo "::warning::$crate: Cargo.toml is $have but the release is $want; not published"
+              continue
+            fi
+            code=$(curl -s -o /dev/null -w '%{http_code}' -A "$GITHUB_REPOSITORY ci" "https://crates.io/api/v1/crates/$crate/$want")
+            if [ "$code" = 200 ]; then
+              echo "$crate $want is already on crates.io"
+              continue
+            fi
+            cargo publish --locked -p "$crate"
+          done < <(jq -r '.[] | select(.publish) | .version as $v | .crates[] | [., $v] | @tsv' <<<"$RELEASES")
+
+  # ------------------------------------------------------------------ ci-ok
+  # The only required status check for branch protection and the merge queue.
+  ci-ok:
+    needs: [changes, gates, check-targets, test, msrv, warm-cache, version, build, release]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every needed job to have succeeded or been skipped
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          jq -e '.changes.result == "success" and all(.[]; .result != "failure" and .result != "cancelled")' <<<"$NEEDS" > /dev/null

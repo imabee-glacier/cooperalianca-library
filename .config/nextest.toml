@@ -1,0 +1,9 @@
+[profile.fast]
+fail-fast = { max-fail = 1, terminate = "immediate" }
+failure-output = "immediate-final"
+
+[profile.gate]
+fail-fast = { max-fail = 1 }
+failure-output = "immediate-final"
+# Raise this if a legitimate test needs longer.
+slow-timeout = { period = "60s", terminate-after = 5 }

@@ -1,0 +1,8 @@
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# The evidenced shipping target is x86_64-unknown-linux-gnu. There is no
+# toolchain pin below 1.90, so no clang override is needed for this target.
