@@ -19,8 +19,8 @@ pub enum Error {
     TwoFactor,
     #[error("the portal privacy policy has not been accepted; accept it in the portal first")]
     PrivacyPolicy,
-    #[error("HTTP request failed")]
-    Transport,
+    #[error("HTTP request failed ({0})")]
+    Transport(&'static str),
     #[error("portal HTTP status {0}")]
     Http(u16),
     #[error("portal API rejected the request: {0}")]

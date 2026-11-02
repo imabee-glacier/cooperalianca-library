@@ -52,6 +52,12 @@ One enrolled account (the maintainer's own) was used on 2026-11-02. Verified:
   `Accept: application/json` on `EmpConfig.js`. The client now sends the web
   app's own `application/json, text/plain, */*`.
 
+A second operator reported a `transport` failure on the first call after enrollment
+that succeeded on the next attempt. The cause was not observable (the error carried
+no reason). The client now uses one connection per request, retries failed connects
+for every method, and names the failure kind. A test reproduces the suspected
+pooled-connection race and fails without the fix.
+
 No write operation, PDF operation, or destructive operation has been run live.
 No further failed-login probes are made: repeated failures can lock an account.
 

@@ -196,6 +196,14 @@ operations whose body holds a password (`register-user`, `reset-password`) never
 show it. A few portal operations need a Google reCAPTCHA token (`unmapped`
 lists them); the SDK does not try to get around that.
 
+Each request uses its own connection, because a server that drops idle
+connections breaks a login sent on a reused one. A failed connect is retried
+up to three times for any request, since nothing reached the server; GETs also
+retry other transient failures. A login or write is never replayed after it
+was sent. A `transport` error says why in parentheses (`connect`, `timeout`,
+`request`, `read`, ...) and is marked `retryable`. An unattended watch should
+retry a `retryable` error a few times and alert only if it persists.
+
 Several commands may run at once, for example a cron job and an agent call:
 the CLI waits up to 60 seconds for the store lock instead of failing.
 
