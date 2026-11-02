@@ -163,7 +163,8 @@ impl Client {
             let mut req = self
                 .http
                 .request(method.clone(), u.clone())
-                .header("Accept", "application/json");
+                // The web app (axios) sends this; the portal answers 406 to a bare application/json.
+                .header("Accept", "application/json, text/plain, */*");
             if let Some(c) = &self.config {
                 req = req.header("use-token-externo", c.external_token.as_str());
             }

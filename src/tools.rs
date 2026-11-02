@@ -1,7 +1,7 @@
 //! Agent-facing strict tool inputs, schemas, and explicit safety metadata, one tool per portal operation.
 use crate::catalog::{self, Kind, Method, Op, Out};
 use crate::client::{Output, required};
-use crate::{Client, Error, Result, check_new_bills, rows};
+use crate::{Client, Error, Result, check_new_bills, open_invoice_rows};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -391,7 +391,7 @@ impl Client {
             else {
                 return Err(Error::Parse);
             };
-            let new_bills = check_new_bills(&rows(&content), &previous);
+            let new_bills = check_new_bills(&open_invoice_rows(&content), &previous);
             return Ok(json!({"count":new_bills.len(),"new_bills":new_bills}));
         }
         Ok(match self.call(name, &v)? {

@@ -4,8 +4,8 @@ use clap::{
 use cooperalianca::catalog::{self, Kind, Op, Out};
 use cooperalianca::tools;
 use cooperalianca::{
-    Client, Credentials, Error, Output, Result, Store, check_new_bills, marshal_jsonl, rows,
-    unmarshal_jsonl,
+    Client, Credentials, Error, Output, Result, Store, check_new_bills, marshal_jsonl,
+    open_invoice_rows, unmarshal_jsonl,
 };
 use serde_json::{Map, Value, json};
 use std::{io::Read, path::PathBuf};
@@ -283,7 +283,7 @@ fn run(conn: &Conn, command: &Command) -> Result<Value> {
             let Output::Json(content) = c.call("open_invoices", &json!({"codigoUc": uc}))? else {
                 return Err(Error::Parse);
             };
-            let current = rows(&content);
+            let current = open_invoice_rows(&content);
             let new_bills = check_new_bills(&current, &previous);
             if *update_state {
                 cooperalianca::store::write_private(state, &marshal_jsonl(&current)?)?;

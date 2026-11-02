@@ -1,6 +1,6 @@
 # Audit and design notes
 
-Audit date: 2026-11-02. Subject: the public Cooperalianca Agência Virtual web
+Audit date: 2026-11-02 (live verification added the same day). Subject: the public Cooperalianca Agência Virtual web
 app and its JavaScript bundle. This is a fresh implementation modeled on
 `condo-library`; it shares its encrypted store, offline mode, and release
 pipeline. The portal client is new.
@@ -19,18 +19,34 @@ pipeline. The portal client is new.
 | `Titularidade` is 1 holder, 2 non-holder, 3 linked | An enum in the bundle |
 | Invoice, contract, statement, income-tax, and generation reports are requested as binary blobs | `responseType: "blob"` in the bundle |
 
-No credentialed request has been made. The single probe used a fake identity
-and no further login probes are made: repeated failures can lock an account or
-trigger a challenge.
+## Live verification
+
+One enrolled account (the maintainer's own) was used on 2026-11-02. Verified:
+
+- Login with the enrolled credentials succeeds with no reCAPTCHA token, and the
+  session token is reused across processes.
+- These reads succeeded: `profile`, `consumer_info`, `list_service_requests_home`,
+  `open_invoices`, `last_invoice_summary`, `invoice_years`, `consumption_history`,
+  and `list_shared_units` (empty). Observed shapes: `profile` carries the unit list
+  in `RetPerfilUsuarioUcCarrosselDto`; `open_invoices` returns an object with the
+  open invoices under `ListaFaturasImpressaoDTO` next to `UltimaFaturaPagaUc`;
+  `invoice_years` returns `{Anos: [...]}`. `check_new_bills` uses that shape.
+- `list_linked_units` returned an empty list for an account whose profile lists a
+  unit, so use `profile` to find unit codes.
+- `open_invoice_warnings` was rejected by the portal (`api`) for that account; the
+  cause is not known.
+- A first live attempt failed with HTTP 406 before any login: the portal refuses
+  `Accept: application/json` on `EmpConfig.js`. The client now sends the web
+  app's own `application/json, text/plain, */*`.
+
+No write operation, PDF operation, or destructive operation has been run live.
+No further failed-login probes are made: repeated failures can lock an account.
 
 ## What is not evidenced
 
-- That a successful login works without a reCAPTCHA token. The web app attaches
-  one when its widget has produced it, and only the failed-credential path was
-  observed without it.
-- The shape of any request body or authenticated response. Reads return
-  `Content` unchanged and writes pass the body through. No typed models were
-  invented.
+- The shape of any request body, and of authenticated responses other than the
+  reads listed above. Reads return `Content` unchanged and writes pass the body
+  through. No typed models were invented.
 - Server-side token lifetime, and whether `MinhaCoop/RenovarToken` could replace
   re-login. Its body is unknown, so the SDK reuses the token until a 401 and
   then logs in again once.
@@ -38,8 +54,8 @@ trigger a challenge.
   `arg1` and `arg2` as the web app passes them.
 - Whether `Servicos/NiveisDeTensao` is a lookup or a request; it is gated as a
   write.
-- That every operation behaves live as the bundle suggests. All tests run
-  against a local mock portal with fake credentials.
+- That any operation not listed under live verification behaves as the bundle
+  suggests. Tests run against a local mock portal with fake credentials.
 
 ## Design decisions
 

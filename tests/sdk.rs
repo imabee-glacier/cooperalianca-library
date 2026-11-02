@@ -59,7 +59,11 @@ fn mock(mode: &'static str) -> Mock {
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
             let json = |v: Value| Response::from_string(v.to_string());
-            let mut response = if path == "/agenciavirtual/EmpConfig.js" {
+            let accept = header("accept");
+            let mut response = if path.ends_with(".js") && !accept.contains("*/*") {
+                // The real portal serves static files only when */* is acceptable.
+                Response::from_string("").with_status_code(406)
+            } else if path == "/agenciavirtual/EmpConfig.js" {
                 let api = if mode == "hostile_config" {
                     "https://evil.invalid/api/".to_owned()
                 } else {
@@ -126,7 +130,7 @@ fn mock(mode: &'static str) -> Mock {
                 } else if path.contains("RecuperarFaturasEmAberto") {
                     assert!(path.contains("codigoUc=7"));
                     Response::from_string(
-                        r#"{"Success":true,"Content":[{"CodigoFatura":1,"Valor":9007199254740993.01,"Vencimento":"2026-11-10"}]}"#,
+                        r#"{"Success":true,"Content":{"ListaFaturasImpressaoDTO":[{"CodigoFatura":1,"Valor":9007199254740993.01,"Vencimento":"2026-11-10"}],"UltimaFaturaPagaUc":{"CodigoFatura":0}}}"#,
                     )
                 } else if path.contains("Municipios") {
                     json(json!({"Success":true,"Content":[{"Codigo":1}]}))
@@ -175,7 +179,10 @@ fn encrypted_session_survives_restart_without_password_login() {
     let s = store(dir.path(), &m.base);
     let mut c = Client::from_store(&m.base, s).unwrap();
     let rows = json_out(&mut c, "open_invoices", json!({"codigoUc":7}));
-    assert_eq!(rows[0]["Valor"].to_string(), "9007199254740993.01");
+    assert_eq!(
+        rows["ListaFaturasImpressaoDTO"][0]["Valor"].to_string(),
+        "9007199254740993.01"
+    );
     assert_eq!(m.logins.load(Ordering::SeqCst), 1);
     drop(c);
     let bytes = fs::read(dir.path().join("session.enc")).unwrap();
@@ -184,7 +191,7 @@ fn encrypted_session_survives_restart_without_password_login() {
     fs::remove_file(dir.path().join("credentials.enc")).unwrap();
     let mut c = Client::from_store(&m.base, Store::open(dir.path()).unwrap()).unwrap();
     assert_eq!(
-        json_out(&mut c, "open_invoices", json!({"codigoUc":7}))
+        json_out(&mut c, "open_invoices", json!({"codigoUc":7}))["ListaFaturasImpressaoDTO"]
             .as_array()
             .unwrap()
             .len(),
@@ -600,7 +607,7 @@ fn cli_end_to_end_local_only_with_fake_credentials() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
-        serde_json::from_slice::<Value>(&out.stdout).unwrap()[0]["CodigoFatura"],
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["ListaFaturasImpressaoDTO"][0]["CodigoFatura"],
         1
     );
     let pdf = dir.path().join("fatura.pdf");
@@ -626,7 +633,7 @@ fn cli_end_to_end_local_only_with_fake_credentials() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
-        serde_json::from_slice::<Value>(&out.stdout).unwrap()[0]["CodigoFatura"],
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["ListaFaturasImpressaoDTO"][0]["CodigoFatura"],
         1
     );
     let flag_pdf = dir.path().join("flags.pdf");
