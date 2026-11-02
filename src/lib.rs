@@ -47,6 +47,14 @@ pub fn rows(content: &Value) -> Vec<Value> {
         other => vec![other.clone()],
     }
 }
+/// Open invoices from `open_invoices` content. Observed live: an object whose open invoices are
+/// under `ListaFaturasImpressaoDTO`, next to a last-paid summary that is not an open invoice.
+pub fn open_invoice_rows(content: &Value) -> Vec<Value> {
+    match content.get("ListaFaturasImpressaoDTO") {
+        Some(list) => rows(list),
+        None => rows(content),
+    }
+}
 fn row_key(row: &Value) -> String {
     // serde_json orders object keys, so equal rows serialize identically.
     serde_json::to_string(row).expect("serializable row")
