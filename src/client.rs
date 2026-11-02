@@ -84,6 +84,10 @@ impl Client {
         let http = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
+            // One connection per request. The first call after enrollment does a config GET then a
+            // login POST; a pooled connection the server already closed would fail that POST, and a
+            // login is never replayed blindly.
+            .pool_max_idle_per_host(0)
             .user_agent(concat!(
                 "cooperalianca-library-rust/",
                 env!("CARGO_PKG_VERSION")
@@ -98,7 +102,7 @@ impl Client {
                 a.follow()
             }))
             .build()
-            .map_err(|_| Error::Transport)?;
+            .map_err(|e| Error::Transport(kind(&e)))?;
         Ok(Self {
             offline: false,
             base,
@@ -138,7 +142,7 @@ impl Client {
         (&mut response)
             .take(limit + 1)
             .read_to_end(&mut bytes)
-            .map_err(|_| Error::Transport)?;
+            .map_err(|_| Error::Transport("read"))?;
         if bytes.len() as u64 > limit {
             return Err(Error::TooLarge);
         }
@@ -154,8 +158,9 @@ impl Client {
         if self.offline {
             return Err(Error::Offline);
         }
-        // Only safe GETs retry transient failures. Authentication and writes are sent once.
-        let attempts = if method == Method::GET { 3 } else { 1 };
+        // GETs retry any transient failure. Anything else retries only a failed connect, where the
+        // request never reached the server, so a login or write is never replayed after it was sent.
+        let attempts = 3;
         for attempt in 0..attempts {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(200 << (attempt - 1)));
@@ -178,11 +183,16 @@ impl Client {
             }
             let response = match req.send() {
                 Ok(r) => r,
-                Err(_) if attempt + 1 < attempts => continue,
-                Err(_) => return Err(Error::Transport),
+                Err(e) if attempt + 1 < attempts && (method == Method::GET || e.is_connect()) => {
+                    continue;
+                }
+                Err(e) => return Err(Error::Transport(kind(&e))),
             };
             let status = response.status().as_u16();
-            if matches!(status, 429 | 502 | 503 | 504) && attempt + 1 < attempts {
+            if matches!(status, 429 | 502 | 503 | 504)
+                && attempt + 1 < attempts
+                && method == Method::GET
+            {
                 // Respect Retry-After seconds up to a bounded wait. Long waits are returned to caller.
                 if let Some(wait) = response
                     .headers()
@@ -199,7 +209,7 @@ impl Client {
             }
             return Self::response_bytes(response, limit);
         }
-        Err(Error::Transport)
+        Err(Error::Transport("retries exhausted"))
     }
     /// Reads the backend root and external token the web app itself loads. Fails closed.
     fn load_config(&mut self) -> Result<()> {
@@ -406,6 +416,26 @@ fn portal_message(env: &Value) -> String {
         .collect();
     let m = m.split_whitespace().collect::<Vec<_>>().join(" ");
     if m.is_empty() { "no detail".into() } else { m }
+}
+/// A coarse, secret-free reason for a failed request, so a flaky link can be told from a refusal.
+fn kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_redirect() {
+        "redirect"
+    } else if e.is_body() {
+        "body"
+    } else if e.is_decode() {
+        "decode"
+    } else if e.is_builder() {
+        "builder"
+    } else if e.is_request() {
+        "request"
+    } else {
+        "other"
+    }
 }
 fn config_value(text: &str, key: &str) -> Option<String> {
     let rest = &text[text.find(key)? + key.len()..];

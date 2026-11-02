@@ -975,3 +975,93 @@ fn cli_waits_for_a_busy_store_instead_of_failing() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+/// A server that promises keep-alive but answers one request per connection, and hangs up on any
+/// request that arrives on a reused connection, as a server or proxy dropping idle connections does.
+fn closing_server() -> (String, Arc<AtomicUsize>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let logins = Arc::new(AtomicUsize::new(0));
+    let count = logins.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let count = count.clone();
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let head_end = loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                let want: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while buf.len() < head_end + want {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let first = head.lines().next().unwrap_or("").to_owned();
+                let body = if first.contains("empconfig.js") {
+                    format!(
+                        "const Emp = {{ Config: {{ USE_BACKEND_URL_PROD: \"http://{addr}/api/\", TOKEN_EXTERNO: \"{EXTERNAL}\" }} }};"
+                    )
+                } else if first.starts_with("post /api/auth") {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    r#"{"Success":true,"Content":{"Token":"jwt-1","PossuiAuthDoisFatores":false,"AceitePoliticaPrivacidade":"S"}}"#.into()
+                } else {
+                    r#"{"Success":true,"Content":[{"Codigo":1}]}"#.into()
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                    body.len()
+                );
+                // The race that bites pooled clients: the next request arrives on this connection just
+                // as the server drops it. Hang up on it without answering.
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(400)));
+                let _ = stream.read(&mut chunk);
+            });
+        }
+    });
+    (format!("http://{addr}/"), logins)
+}
+#[test]
+fn first_call_survives_a_server_that_closes_idle_connections() {
+    let (base, logins) = closing_server();
+    for _ in 0..5 {
+        let mut c = Client::with_credentials(&base, creds()).unwrap();
+        // Config GET, then login POST, then the read: three requests on a server that drops each
+        // connection after answering. None may fail, and the login is sent exactly once.
+        assert_eq!(
+            json_out(&mut c, "list_linked_units", json!({}))[0]["Codigo"],
+            1
+        );
+    }
+    assert_eq!(logins.load(Ordering::SeqCst), 5);
+}
+#[test]
+fn transport_errors_say_why_without_leaking_anything() {
+    // Nothing listens on port 1: a connect failure, which is categorized and retryable.
+    let mut c = Client::with_credentials("http://127.0.0.1:1/", creds()).unwrap();
+    let e = c.call("list_linked_units", &json!({})).err().unwrap();
+    assert!(matches!(e, Error::Transport("connect")), "{e}");
+    assert_eq!(e.as_json()["retryable"], true);
+    let text = e.to_string();
+    assert!(
+        !text.contains("127.0.0.1") && !text.contains("fake"),
+        "{text}"
+    );
+}
