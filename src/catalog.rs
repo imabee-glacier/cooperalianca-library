@@ -35,6 +35,8 @@ pub struct Op {
     pub kind: Kind,
     pub out: Out,
     pub help: &'static str,
+    /// A portal rejection starting with this text means "nothing to list", not a failure.
+    pub empty_on: &'static str,
 }
 #[allow(clippy::too_many_arguments)]
 const fn op(
@@ -58,10 +60,15 @@ const fn op(
         kind,
         out: Out::Json,
         help,
+        empty_on: "",
     }
 }
 const fn pdf(mut o: Op) -> Op {
     o.out = Out::Pdf;
+    o
+}
+const fn empty(mut o: Op, message: &'static str) -> Op {
+    o.empty_on = message;
     o
 }
 const fn opt(mut o: Op, optional: &'static [&'static str]) -> Op {
@@ -289,15 +296,18 @@ pub static OPS: &[Op] = &[
         R,
         "Read meter verification results.",
     ),
-    op(
-        "open_invoice_warnings",
-        G,
-        "PerfilUsuario/BuscaAvisosComFaturasAbertas",
-        NONE,
-        NONE,
-        false,
-        R,
-        "Read open-invoice warnings.",
+    empty(
+        op(
+            "open_invoice_warnings",
+            G,
+            "PerfilUsuario/BuscaAvisosComFaturasAbertas",
+            NONE,
+            NONE,
+            false,
+            R,
+            "Read open-invoice warnings. The portal's \"no cut-off notices\" answer is returned as an empty list.",
+        ),
+        "Sem avisos de corte",
     ),
     op(
         "settlement_statement_data",
@@ -370,15 +380,18 @@ pub static OPS: &[Op] = &[
         R,
         "List units shared with the user.",
     ),
-    op(
-        "list_removed_units",
-        G,
-        "Usuarios/RecuperarListaUcsRetiradasCarrossel",
-        NONE,
-        NONE,
-        false,
-        R,
-        "List units removed from the carousel.",
+    empty(
+        op(
+            "list_removed_units",
+            G,
+            "Usuarios/RecuperarListaUcsRetiradasCarrossel",
+            NONE,
+            NONE,
+            false,
+            R,
+            "List units removed from the carousel.",
+        ),
+        "Sem avisos de corte",
     ),
     op(
         "check_unit_registration",
@@ -460,16 +473,6 @@ pub static OPS: &[Op] = &[
         false,
         R,
         "Summary of an invoice.",
-    ),
-    op(
-        "quick_second_copy",
-        G,
-        "ImprimirFaturas/Recuperar2ViaRapida",
-        NONE,
-        &["CodigoUc"],
-        false,
-        R,
-        "Quick second copy data.",
     ),
     op(
         "payment_code",
@@ -1181,6 +1184,10 @@ pub static OPS: &[Op] = &[
     ),
 ];
 
+/// Whether a rejection's message may be shown. Bodies that carry passwords never are.
+pub fn reports_message(op: &Op) -> bool {
+    !matches!(op.name, "register_user" | "reset_password")
+}
 pub fn find(name: &str) -> Option<&'static Op> {
     OPS.iter().find(|o| o.name == name)
 }
@@ -1202,6 +1209,10 @@ pub static UNMAPPED: &[(&str, &str)] = &[
     (
         "MinhaCoop/RenovarToken",
         "session token handling is internal to the client",
+    ),
+    (
+        "ImprimirFaturas/Recuperar2ViaRapida",
+        "the portal demands a Google reCAPTCHA token, which a direct-HTTP client cannot provide",
     ),
     (
         "MinhaCoop/RecuperarTokenExterno",

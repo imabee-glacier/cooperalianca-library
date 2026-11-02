@@ -410,7 +410,7 @@ impl Error {
             Self::PrivacyPolicy => "privacy_policy_not_accepted",
             Self::Transport => "transport",
             Self::Http(_) => "http",
-            Self::Api => "api",
+            Self::Api(_) => "api",
             Self::Parse => "parse",
             Self::TooLarge => "response_too_large",
             Self::Io(_) => "io",

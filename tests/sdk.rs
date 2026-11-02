@@ -118,6 +118,10 @@ fn mock(mode: &'static str) -> Mock {
                     || (mode == "transient" && count.load(Ordering::SeqCst) <= 3 && method == "GET")
                 {
                     Response::from_string("").with_status_code(503)
+                } else if mode == "no_notices" && path.contains("Retiradas") {
+                    json(
+                        json!({"Success":false,"Message":"Sem avisos de corte para esse consumidor"}),
+                    )
                 } else if mode == "malformed" {
                     Response::from_string("garbage")
                 } else if mode == "failed_envelope" {
@@ -272,6 +276,10 @@ fn api_failures_are_never_empty_results() {
         let mut c = Client::with_credentials(&m.base, creds()).unwrap();
         let e = c.call("list_linked_units", &json!({})).err().unwrap();
         assert_eq!(e.code(), want, "{mode}");
+        if mode == "failed_envelope" {
+            // A read's rejection carries the portal's own reason so an agent can act on it.
+            assert!(e.to_string().contains("nope"), "{e}");
+        }
     }
 }
 #[test]
@@ -911,5 +919,59 @@ fn every_operation_has_a_flag_command_and_stdin_tool_still_works() {
     assert_eq!(
         serde_json::from_slice::<Value>(&out.stdout).unwrap()["sent"],
         false
+    );
+}
+
+#[test]
+fn rejection_messages_show_except_for_password_bodies() {
+    let m = mock("failed_envelope");
+    let mut c = Client::with_credentials(&m.base, creds()).unwrap();
+    for (name, shown) in [("request_other_service", true), ("reset_password", false)] {
+        let op = catalog::find(name).unwrap();
+        let id = tools::plan(op, &json!({"body":{"x":1}}))
+            .unwrap()
+            .preview_id;
+        let e = c
+            .call(
+                name,
+                &json!({"body":{"x":1},"confirm":true,"preview_id":id}),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(e.code(), "api");
+        assert_eq!(e.to_string().contains("nope"), shown, "{name}: {e}");
+    }
+}
+#[test]
+fn portal_no_notices_rejection_is_an_empty_list() {
+    let m = mock("no_notices");
+    let mut c = Client::with_credentials(&m.base, creds()).unwrap();
+    assert_eq!(json_out(&mut c, "list_removed_units", json!({})), json!([]));
+    // Other rejections of the same operation are still errors.
+    let m = mock("failed_envelope");
+    let mut c = Client::with_credentials(&m.base, creds()).unwrap();
+    assert!(c.call("list_removed_units", &json!({})).is_err());
+}
+#[test]
+fn cli_waits_for_a_busy_store_instead_of_failing() {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let held = store(&path, "https://portal.test/");
+    let child = Command::new(env!("CARGO_BIN_EXE_cooperalianca"))
+        .arg("--store-dir")
+        .arg(&path)
+        .arg("forget-session")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(std::time::Duration::from_millis(800));
+    drop(held);
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }

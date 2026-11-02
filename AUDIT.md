@@ -31,6 +31,19 @@ One enrolled account (the maintainer's own) was used on 2026-11-02. Verified:
   in `RetPerfilUsuarioUcCarrosselDto`; `open_invoices` returns an object with the
   open invoices under `ListaFaturasImpressaoDTO` next to `UltimaFaturaPagaUc`;
   `invoice_years` returns `{Anos: [...]}`. `check_new_bills` uses that shape.
+- `invoice_pdf` returned a real PDF, saved with mode 0600. `invoice_detail`,
+  `invoice_summary`, `list_invoices_by_year`, `consumption_history_60_months`,
+  `invoice_xml`, `payment_code`, `digital_delivery_*`, the `generation_*` reads
+  (except `generation_swap_data`), the `*_data` form reads, `planned_outages`,
+  `list_agreements`, `unit_profile`, `settlement_statement_data` and the public
+  reference lists also succeeded.
+- Rejections seen, with the portal's own reason: `open_invoice_warnings` and
+  `list_removed_units` say "Sem avisos de corte para esse consumidor" (no cut-off
+  notices), which the SDK returns as an empty list; `quick_second_copy` says
+  "Google reCAPTCHA falhou", so it is not exposed; `list_notifications` says the
+  operator has not configured its backend; `privacy_policy_url` says the operator
+  has not configured the policy URL; `profile_without_unit`, `payment_link`
+  and `generation_swap_data` returned generic errors for this account.
 - `list_linked_units` returned an empty list for an account whose profile lists a
   unit, so use `profile` to find unit codes.
 - `open_invoice_warnings` was rejected by the portal (`api`) for that account; the

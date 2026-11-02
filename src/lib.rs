@@ -23,8 +23,8 @@ pub enum Error {
     Transport,
     #[error("portal HTTP status {0}")]
     Http(u16),
-    #[error("portal API rejected the request")]
-    Api,
+    #[error("portal API rejected the request: {0}")]
+    Api(String),
     #[error("invalid portal response")]
     Parse,
     #[error("response exceeds size limit")]
