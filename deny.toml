@@ -1,0 +1,30 @@
+# Policy for `cargo deny --locked --workspace check`, run by CI when manifests change.
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[licenses]
+# Every third-party license currently in Cargo.lock; r-efi is dual-licensed, so the
+# LGPL alternative is not needed.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "LicenseRef-cooperalianca-library-unlicensed",
+]
+# Unpublished workspace members (workspace-hack) carry no license.
+private = { ignore = true }
+
+# cooperalianca-library declares no license yet (and is not on crates.io). Treat it explicitly rather
+# than weakening the policy; replace this with a real `license` in Cargo.toml when chosen.
+[[licenses.clarify]]
+crate = "cooperalianca-library"
+expression = "LicenseRef-cooperalianca-library-unlicensed"
+license-files = []

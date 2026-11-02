@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# Bash 3.2: indexed arrays only. All repository-specific scope is here.
+set -euo pipefail
+export RUSTUP_AUTO_INSTALL=0
+CONFIG='{
+  "BASE_REF": "origin/main",
+  "FEATURES": "default",
+  "COMPONENTS": [{"name":"cooperalianca-library","crates":["cooperalianca-library"],"targets":["x86_64-unknown-linux-gnu"]}],
+  "TARGETS": [{"triple":"x86_64-unknown-linux-gnu","method":"native"}]
+}'
+
+MODE=fast FULL=0 FAIL_FAST=1 FORCE=0 BASE_REF='' BUILD_TARGET=''
+SELECTED=() ORIGINAL=("$@")
+START=$SECONDS
+usage() {
+    printf '%s\n' 'Usage: scripts/check [fast|gate|build [component ...]] [--base REF] [--full] [--no-fail-fast] [--force] [--target TRIPLE|all (build only)]' >&2
+    exit 2
+}
+if [ "$#" -gt 0 ]; then
+    case "$1" in fast|gate|build) MODE=$1; shift;; esac
+fi
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --base|--target)
+            [ "$#" -ge 2 ] && [ -n "$2" ] && [[ "$2" != --* ]] || usage
+            if [ "$1" = --base ]; then BASE_REF=$2; else BUILD_TARGET=$2; fi
+            shift 2;;
+        --full) FULL=1; shift;;
+        --no-fail-fast) FAIL_FAST=0; shift;;
+        --force) FORCE=1; shift;;
+        --*) usage;;
+        *) [ "$MODE" = build ] || usage; SELECTED+=("$1"); shift;;
+    esac
+done
+[ "$MODE" = build ] || [ -z "$BUILD_TARGET" ] || usage
+need() { command -v "$1" >/dev/null 2>&1 || { printf 'Missing tool: %s\n' "$1" >&2; exit 2; }; }
+for tool in git jq cargo rustc rustup cargo-hakari cargo-nextest ps awk; do need "$tool"; done
+if [ "$MODE" != build ]; then need cargo-clippy; need rustfmt; fi
+ROOT=$(git rev-parse --show-toplevel) || exit 2
+cd "$ROOT"
+export CARGO_TARGET_DIR="$ROOT/target/check"
+if [ -t 1 ]; then export CARGO_TERM_COLOR=always; else export CARGO_TERM_COLOR=never; fi
+LOGDIR="$ROOT/target/check-logs"
+mkdir -p "$LOGDIR"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/cargo-check.XXXXXXXX")
+PIDS=() NAMES=() COMMANDS=() BEGINS=() FINISHED=() FAILURES=()
+# Stop parents before children so a lane cannot start another tool during cleanup.
+kill_tree() {
+    local pid=$1 child
+    kill -STOP "$pid" 2>/dev/null || return 0
+    for child in $(ps -ax -o pid= -o ppid= | awk -v p="$pid" '$2 == p {print $1}'); do
+        kill_tree "$child"
+    done
+    kill -TERM "$pid" 2>/dev/null || true
+    kill -CONT "$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+}
+cleanup() {
+    local i=0
+    while [ "$i" -lt "${#PIDS[@]}" ]; do
+        if [ "${FINISHED[$i]}" = 0 ]; then
+            kill_tree "${PIDS[$i]}"
+            wait "${PIDS[$i]}" 2>/dev/null || true
+            FINISHED[i]=1
+        fi
+        i=$((i + 1))
+    done
+    rm -rf "$TMP" # Only our temporary control files, never a Cargo target dir.
+}
+trap 'cleanup 2>/dev/null' EXIT
+trap 'exit 1' INT TERM HUP
+RERUN=$(printf '%q ' "$ROOT/scripts/check" "${ORIGINAL[@]+"${ORIGINAL[@]}"}")
+report_failures() {
+    local i
+    for i in "${FAILURES[@]+"${FAILURES[@]}"}"; do
+        printf 'FAIL: %s. Rerun: %s\n' "${NAMES[$i]}" "${COMMANDS[$i]}"
+    done
+}
+# Each stage has its own log and completion file. Polling all lanes means a
+# cheap background failure interrupts clippy immediately (Bash 3.2 has no wait -n).
+launch() {
+    local name=$1 scope=$2 i=${#PIDS[@]} log
+    shift 2
+    log="$LOGDIR/$MODE-$name.log"
+    NAMES[i]=$name; BEGINS[i]=$SECONDS; FINISHED[i]=0
+    COMMANDS[i]=$RERUN
+    printf '[run] %s (%s)\n' "$name" "$scope"
+    (
+        set +e
+        if [ "$FULL" = 1 ]; then
+            (set -e; "$@") 2>&1 | tee "$log"
+            rc=$?
+        else
+            (set -e; "$@") >"$log" 2>&1
+            rc=$?
+        fi
+        printf '%s\n' "$rc" >"$TMP/$i.tmp"
+        mv "$TMP/$i.tmp" "$TMP/$i.done"
+    ) &
+    PIDS[i]=$!
+    LAST=$i
+}
+poll() {
+    local i=0 rc elapsed
+    while [ "$i" -lt "${#PIDS[@]}" ]; do
+        if [ "${FINISHED[$i]}" = 0 ] && [ ! -f "$TMP/$i.done" ] && ! kill -0 "${PIDS[$i]}" 2>/dev/null; then
+            # A killed lane must fail, rather than leave the monitor waiting forever.
+            printf '1\n' >"$TMP/$i.done"
+        fi
+        if [ "${FINISHED[$i]}" = 0 ] && [ -f "$TMP/$i.done" ]; then
+            rc=$(cat "$TMP/$i.done"); wait "${PIDS[$i]}" || true
+            FINISHED[i]=1; elapsed=$((SECONDS - BEGINS[i]))
+            if [ "$rc" = 0 ]; then
+                printf '[ok] %s %ss\n' "${NAMES[$i]}" "$elapsed"
+            else
+                if [ "$FULL" = 0 ]; then cat "$LOGDIR/$MODE-${NAMES[$i]}.log"; fi
+                printf '[FAIL] %s %ss\n' "${NAMES[$i]}" "$elapsed"
+                FAILURES+=("$i")
+                if [ "$FAIL_FAST" = 1 ]; then cleanup 2>/dev/null; report_failures; exit 1; fi
+            fi
+        fi
+        i=$((i + 1))
+    done
+}
+run() {
+    local current
+    poll
+    launch "$@"; current=$LAST
+    while [ "${FINISHED[$current]}" = 0 ]; do poll; [ "${FINISHED[$current]}" = 1 ] || sleep 0.1; done
+}
+join_lanes() {
+    local i pending
+    while :; do
+        poll; pending=0; i=0
+        while [ "$i" -lt "${#PIDS[@]}" ]; do
+            [ "${FINISHED[$i]}" = 1 ] || pending=1
+            i=$((i + 1))
+        done
+        [ "$pending" = 1 ] || break
+        sleep 0.1
+    done
+}
+version_at_least() {
+    jq -en --arg actual "$1" --arg minimum "$2" '
+      def v: split(".") | map(tonumber); ($actual|v) >= ($minimum|v)' >/dev/null
+}
+for spec in 'cargo-hakari 0.9.9' 'cargo-nextest 0.9.89'; do
+    tool=${spec% *}; minimum=${spec#* }
+    version=$($tool --version | awk 'NR==1 {print $2}')
+    version_at_least "$version" "$minimum" || { printf '%s >= %s required (found %s)\n' "$tool" "$minimum" "$version"; exit 2; }
+done
+if [ ! -f .config/hakari.toml ]; then
+    cat >&2 <<'SETUP'
+Missing .config/hakari.toml. One-time setup:
+cargo --locked hakari init workspace-hack
+# Set platforms in .config/hakari.toml to TARGETS plus the host triple.
+cargo --locked hakari generate
+cargo --locked hakari manage-deps
+cargo --locked hakari verify
+SETUP
+    exit 2
+fi
+# Read the single scalar without a TOML parser dependency. Hakari validates the
+# whole file; both quoted TOML string forms are accepted here.
+HACK=$(awk -F= '/^[[:space:]]*hakari-package[[:space:]]*=/ {gsub(/[[:space:]"\047]/,"",$2); sub(/#.*/,"",$2); print $2}' .config/hakari.toml)
+[ -n "$HACK" ] || { printf 'Missing hakari-package in .config/hakari.toml\n'; exit 2; }
+HOST=$(rustc -vV | awk '/^host:/ {print $2}')
+RELEASE=$(rustc -vV | awk '/^release:/ {print $2}')
+case "$RELEASE" in *nightly*|*beta*|*dev*) printf 'Stable Rust required; found %s\n' "$RELEASE"; exit 2;; esac
+# Explicit host selection avoids an inherited cross target affecting tests.
+export CARGO_BUILD_TARGET="$HOST"
+if [ -z "$BASE_REF" ]; then BASE_REF=$(jq -r .BASE_REF <<<"$CONFIG"); fi
+preflight() {
+    cargo metadata --locked --format-version 1 >"$TMP/metadata.json"
+    git merge-base HEAD "$BASE_REF" >"$TMP/base"
+    {
+        git diff --name-only --no-renames -z "$(cat "$TMP/base")" HEAD
+        git diff --name-only --no-renames -z --cached
+        git diff --name-only --no-renames -z
+        git ls-files --others --exclude-standard -z
+    } | jq -Rs 'split("\u0000") | map(select(length>0)) | unique' >"$TMP/changed.json"
+    jq --arg hack "$HACK" '[.workspace_members as $ids | .packages[] | select(.id as $id | $ids|index($id)) | select(.name != $hack)]' "$TMP/metadata.json" >"$TMP/members.json"
+}
+# Preflight metadata failure is a check failure, not a successful empty scope.
+run preflight workspace preflight
+# In collect-all mode later stages need valid metadata and a merge base.
+if [ "${#FAILURES[@]}" -gt 0 ]; then report_failures; exit 1; fi
+BASE=$(cat "$TMP/base")
+jq -e --slurpfile members "$TMP/members.json" '
+ .FEATURES as $features | .TARGETS as $targets |
+ ($features == "default" or $features == "all") and
+ ([.COMPONENTS[].name]|length == (unique|length)) and
+ ([$targets[].triple]|length == (unique|length)) and
+ all($targets[]; (.triple|test("^[A-Za-z0-9][A-Za-z0-9_-]+$")) and (.method == "native" or .method == "zigbuild")) and
+ all(.COMPONENTS[]; (.name|test("^[A-Za-z0-9_-]+$")) and (.crates|length>0) and (.targets|length>0) and
+   all(.crates[]; . as $c | any($members[0][]; .name==$c)) and
+   all(.targets[]; . as $t | any($targets[]; .triple==$t)))' <<<"$CONFIG" >/dev/null || { printf 'Invalid CONFIG or unknown package/target\n'; exit 2; }
+if [ "$MODE" = build ]; then
+    for component in "${SELECTED[@]+"${SELECTED[@]}"}"; do
+        jq -e --arg name "$component" 'any(.COMPONENTS[]; .name==$name)' <<<"$CONFIG" >/dev/null || usage
+    done
+    if [ -n "$BUILD_TARGET" ] && [ "$BUILD_TARGET" != all ] && [ "$BUILD_TARGET" != "$HOST" ]; then
+        jq -e --arg target "$BUILD_TARGET" 'any(.TARGETS[]; .triple==$target)' <<<"$CONFIG" >/dev/null || usage
+    fi
+fi
+COUNT=$(jq length "$TMP/changed.json")
+if [ "$FORCE" = 0 ]; then
+    if [ "$COUNT" -gt 0 ] && jq -e 'all(.[]; test("^docs/|(^|/)[^/]*\\.md$|^LICENSE[^/]*$|^\\.github/ISSUE_TEMPLATE/"))' "$TMP/changed.json" >/dev/null; then
+        printf 'docs-only: nothing to check\n'; exit 0
+    fi
+    if [ "$MODE" = fast ] && [ "$COUNT" = 0 ]; then printf 'no changes: nothing to check\n'; exit 0; fi
+fi
+MANIFEST_CHANGE=$(jq -r 'any(.[]; test("(^|/)Cargo.toml$|^Cargo.lock$|^\\.config/hakari.toml$"))' "$TMP/changed.json")
+HACK_PATH=$(jq -r --arg hack "$HACK" --arg root "$ROOT/" '.packages[]|select(.name==$hack)|.manifest_path|ltrimstr($root)' "$TMP/metadata.json")
+# Pick the longest containing member path; then close over every workspace
+# dependency edge, including build and dev edges (resolve.nodes.deps).
+jq --slurpfile changed "$TMP/changed.json" --slurpfile members "$TMP/members.json" --arg root "$ROOT/" --arg hackpath "$HACK_PATH" '
+ def docs: test("^docs/|(^|/)[^/]*\\.md$|^LICENSE[^/]*$|^\\.github/ISSUE_TEMPLATE/");
+ . as $meta | $members[0] as $members |
+ ($changed[0]|map(select(docs|not))) as $files |
+ if any($files[]; . == "Cargo.lock" or . == "Cargo.toml" or . == $hackpath or test("^rust-toolchain|^\\.cargo/|^\\.config/(nextest|hakari).toml$|^deny.toml$|^scripts/check$")) then $members|map(.name)
+ else
+   [$files[] as $file | [$members[] | (.manifest_path|ltrimstr($root)|sub("Cargo.toml$";"")) as $dir | select($file|startswith($dir)) | {id, depth:($dir|length)}] | sort_by(.depth) | last | .id] as $owners |
+   if any($owners[]; .==null) then $members|map(.name) else
+     def expand($ids): ([$meta.resolve.nodes[]|select(any(.deps[]; .pkg as $id|$ids|index($id)))|.id]+$ids|unique) as $next | if $next==$ids then $next else expand($next) end;
+     expand($owners|unique) as $ids | [$members[]|select(.id as $id|$ids|index($id))|.name]
+   end
+ end | sort' "$TMP/metadata.json" >"$TMP/affected.json"
+PACKAGES=()
+if [ "$MODE" = fast ]; then
+    if [ "$FORCE" = 1 ] && [ "$(jq length "$TMP/affected.json")" = 0 ]; then jq '[.[].name]' "$TMP/members.json" >"$TMP/affected.json"; fi
+    printf 'Affected crates: %s\n' "$(jq -r 'join(", ")' "$TMP/affected.json")"
+    while IFS= read -r package; do PACKAGES+=(-p "$package"); done < <(jq -r '.[]' "$TMP/affected.json")
+    SCOPE="$(jq length "$TMP/affected.json") crates"
+else
+    PACKAGES=(--workspace); SCOPE=workspace
+fi
+FEATURE_ARGS=()
+if [ "$MODE" = gate ] && [ "$(jq -r .FEATURES <<<"$CONFIG")" = all ]; then FEATURE_ARGS=(--all-features); fi
+SHORT=(); [ "$FULL" = 1 ] || SHORT=(--message-format short)
+NEXT_ARGS=(); [ "$FAIL_FAST" = 1 ] || NEXT_ARGS=(--no-fail-fast)
+NO_TEST_ARGS=(); [ "$MODE" != fast ] || NO_TEST_ARGS=(--no-tests=pass)
+hakari() {
+    if ! cargo --locked hakari generate --diff || ! cargo --locked hakari manage-deps --dry-run; then
+        printf 'Fix: cargo hakari generate && cargo hakari manage-deps\n'; return 1
+    fi
+}
+commit_lint() {
+    local sha subject message bad=0
+    while IFS= read -r sha; do
+        subject=$(git show -s --format=%s "$sha"); message=$(git show -s --format=%B "$sha")
+        if ! jq -en --arg subject "$subject" --arg message "$message" '
+          ($subject|test("^(feat|fix|perf|docs|chore|ci|test|style|refactor|build|revert)(\\([^)]+\\))?!?: .+")) and
+          ($message|test("\\[(skip ci|ci skip|no ci|skip actions|actions skip)\\]|skip-checks:";"i")|not)' >/dev/null; then
+            printf '%s %s\n' "$(git rev-parse --short "$sha")" "$subject"; bad=1
+        fi
+    done < <(git rev-list "$BASE..HEAD")
+    return "$bad"
+}
+check_target() {
+    local triple=$1
+    if ! rustup target list --installed | awk -v t="$triple" '$0==t {found=1} END {exit !found}'; then
+        printf 'Missing Rust target. Run: rustup target add %s\n' "$triple"; return 1
+    fi
+}
+linker_tools() {
+    local triple=$1
+    if [ -f .cargo/config.toml ] && awk -v t="$triple" '
+       /^\[/ {active=index($0,"target." t ".") || index($0,"target.\"" t "\".")}
+       active && /linker[[:space:]]*=[[:space:]]*"clang"/ {found=1}
+       END {exit !found}' .cargo/config.toml; then need clang; need ld.lld; fi
+}
+crates_for_target() {
+    jq -r --arg triple "$1" --argjson chosen "$2" --arg hack "$HACK" '
+      [.COMPONENTS[] | select(.name as $n|$chosen|index($n)) | select(.targets|index($triple)) | .crates[] | select(.!=$hack)]|unique|.[]' <<<"$CONFIG"
+}
+msrv() {
+    local version
+    version=$(jq -r '[.workspace_members as $ids | .packages[] | select(.id as $id|$ids|index($id)) | .rust_version | select(.!=null)]|sort_by(split(".")|map(tonumber))|last // empty' "$TMP/metadata.json")
+    if [ -z "$version" ]; then printf 'MSRV: not configured\n'; return 0; fi
+    if ! rustup run "$version" rustc --version >/dev/null 2>&1; then
+        printf 'rustup toolchain install %s --profile minimal\n' "$version"; return 1
+    fi
+    CARGO_TARGET_DIR="$ROOT/target/check-msrv" cargo "+$version" check --workspace --locked
+}
+ALL_COMPONENTS=$(jq '[.COMPONENTS[].name]' <<<"$CONFIG")
+linker_tools "$HOST"
+if [ "$MODE" = build ]; then
+    need shasum
+    CHOSEN=$ALL_COMPONENTS
+    if [ "${#SELECTED[@]}" -gt 0 ]; then CHOSEN=$(printf '%s\n' "${SELECTED[@]}" | jq -Rs 'split("\n")|map(select(length>0))|unique'); fi
+    jq -en --argjson selected "$CHOSEN" --argjson all "$ALL_COMPONENTS" 'all($selected[]; . as $n|$all|index($n))' >/dev/null || usage
+    if [ -z "$BUILD_TARGET" ]; then BUILD_TARGET=$HOST; fi
+    if [ "$BUILD_TARGET" = all ]; then
+        TRIPLES=$(jq -r --argjson selected "$CHOSEN" '[.COMPONENTS[]|select(.name as $n|$selected|index($n))|.targets[]]|unique|.[]' <<<"$CONFIG")
+    else
+        TRIPLES=$BUILD_TARGET
+        jq -en --arg target "$BUILD_TARGET" --arg host "$HOST" --argjson config "$CONFIG" '$target==$host or any($config.TARGETS[]; .triple==$target)' >/dev/null || usage
+    fi
+    build_target() {
+        local triple=$1 method=$2 log=$3
+        shift 3
+        check_target "$triple" || return 1
+        if [ "$triple" = "$HOST" ]; then
+            cargo build --release --locked "$@" --message-format json-render-diagnostics | tee "$log"
+        elif [ "$method" = zigbuild ]; then
+            cargo zigbuild --release --locked --target "$triple" "$@" --message-format json-render-diagnostics | tee "$log"
+        else
+            cargo build --release --locked --target "$triple" "$@" --message-format json-render-diagnostics | tee "$log"
+        fi
+    }
+    artifacts() {
+        local triple=$1 log=$2 component dest executable filename size
+        while IFS= read -r component; do
+            dest="$ROOT/dist/$component/$triple"; mkdir -p "$dest"
+            : >"$dest/SHA256SUMS"
+            while IFS= read -r executable; do
+                filename=${executable##*/}; cp "$executable" "$dest/$filename"
+                (cd "$dest"; shasum -a 256 "$filename") >>"$dest/SHA256SUMS"
+                size=$(wc -c <"$dest/$filename" | tr -d ' ')
+                printf '%s (%s bytes)\n' "dist/$component/$triple/$filename" "$size"
+            done < <(jq -r --arg component "$component" --argjson config "$CONFIG" --slurpfile meta "$TMP/metadata.json" '
+                select(.reason=="compiler-artifact" and .executable!=null) | .package_id as $id |
+                select(any($meta[0].packages[]; .id==$id and (.name as $n|any($config.COMPONENTS[]; .name==$component and (.crates|index($n)))))) | .executable' "$log" | sort -u)
+        done < <(jq -r --argjson chosen "$CHOSEN" --arg triple "$triple" --arg host "$HOST" '.COMPONENTS[]|select(.name as $n|$chosen|index($n))|select($triple==$host or (.targets|index($triple)))|.name' <<<"$CONFIG")
+    }
+    for triple in $TRIPLES; do
+        linker_tools "$triple"
+        method=$(jq -r --arg t "$triple" '.TARGETS[]|select(.triple==$t)|.method' <<<"$CONFIG")
+        if [ "$method" = zigbuild ] && [ "$triple" != "$HOST" ]; then need cargo-zigbuild; need zig; fi
+    done
+    # Build also verifies Hakari: release builds must not accept stale unification.
+    launch hakari workspace hakari
+    for triple in $TRIPLES; do
+        args=()
+        if [ "$triple" = "$HOST" ] && [ "$BUILD_TARGET" != all ]; then
+            crates=$(jq -r --argjson chosen "$CHOSEN" '[.COMPONENTS[]|select(.name as $n|$chosen|index($n))|.crates[]]|unique|.[]' <<<"$CONFIG")
+        else crates=$(crates_for_target "$triple" "$CHOSEN"); fi
+        [ -n "$crates" ] || { printf 'No selected components ship on %s\n' "$triple"; exit 2; }
+        for package in $crates; do args+=(-p "$package"); done
+        method=$(jq -r --arg t "$triple" '.TARGETS[]|select(.triple==$t)|.method' <<<"$CONFIG")
+        log="$TMP/artifacts-$triple.json"
+        run "build-$triple" "$(printf '%s\n' "$crates" | wc -l | tr -d ' ') crates" build_target "$triple" "$method" "$log" "${args[@]}"
+        if [ "$(cat "$TMP/$LAST.done")" = 0 ]; then
+            run "artifacts-$triple" workspace artifacts "$triple" "$log"
+            if [ "$FULL" = 0 ] && [ "$(cat "$TMP/$LAST.done")" = 0 ]; then cat "$LOGDIR/$MODE-artifacts-$triple.log"; fi
+        fi
+    done
+else
+    if [ "$MODE" = gate ]; then
+        if [ "$MANIFEST_CHANGE" = true ]; then need cargo-deny; fi
+        while IFS= read -r triple; do linker_tools "$triple"; done < <(jq -r '.TARGETS[].triple' <<<"$CONFIG")
+        launch fmt workspace cargo --locked fmt --all --check
+        launch hakari workspace hakari
+        launch commits workspace commit_lint
+        if [ "$MANIFEST_CHANGE" = true ]; then launch deny workspace cargo deny --locked check; fi
+    else
+        if [ "${#PACKAGES[@]}" -eq 0 ]; then
+            printf 'No affected code crates.\n'
+        else launch fmt "$SCOPE" cargo --locked fmt "${PACKAGES[@]}" --check; fi
+        if [ "$MANIFEST_CHANGE" = true ]; then launch hakari workspace hakari; fi
+    fi
+    if [ "${#PACKAGES[@]}" -gt 0 ]; then
+        run clippy "$SCOPE" cargo clippy "${PACKAGES[@]}" --all-targets --locked "${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}" "${SHORT[@]+"${SHORT[@]}"}" -- -D warnings
+        run nextest "$SCOPE" cargo nextest run "${PACKAGES[@]}" --locked --profile "$MODE" "${NO_TEST_ARGS[@]+"${NO_TEST_ARGS[@]}"}" "${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}" "${NEXT_ARGS[@]+"${NEXT_ARGS[@]}"}"
+    fi
+    if [ "$MODE" = gate ]; then
+        run doctests workspace cargo test --doc --workspace --locked "${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}"
+        while IFS= read -r triple; do
+            args=(); crates=$(crates_for_target "$triple" "$ALL_COMPONENTS")
+            [ -n "$crates" ] || continue
+            for package in $crates; do args+=(-p "$package"); done
+            cross_check() { check_target "$1" && cargo check --locked --target "$1" "${args[@]}"; }
+            run "target-$triple" "$(printf '%s\n' "$crates" | wc -l | tr -d ' ') crates" cross_check "$triple"
+        done < <(jq -r '.TARGETS[].triple' <<<"$CONFIG")
+        join_lanes
+        run msrv workspace msrv
+        if [ "$FULL" = 0 ] && ! jq -e 'any(.[]; .rust_version!=null)' "$TMP/members.json" >/dev/null; then printf 'MSRV: not configured\n'; fi
+    fi
+fi
+join_lanes
+if [ "${#FAILURES[@]}" -gt 0 ]; then report_failures; exit 1; fi
+case "$MODE" in
+    fast) printf 'PASS fast in %ss. Not verified: unaffected crates, doc tests, cross-target checks, MSRV, commit messages. Run scripts/check gate before pushing.\n' "$((SECONDS - START))";;
+    gate) printf 'PASS gate in %ss.\n' "$((SECONDS - START))";;
+    build) printf 'PASS build in %ss. Tests were not run.\n' "$((SECONDS - START))";;
+esac
