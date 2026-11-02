@@ -618,6 +618,36 @@ fn cli_end_to_end_local_only_with_fake_credentials() {
         fs::metadata(&pdf).unwrap().permissions().mode() & 0o777,
         0o600
     );
+    // The same operations run from flags alone, with no stdin, for agents that cannot pipe input.
+    let out = run(&["open-invoices", "--codigo-uc", "7"], "");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()[0]["CodigoFatura"],
+        1
+    );
+    let flag_pdf = dir.path().join("flags.pdf");
+    let out = run(
+        &[
+            "invoice-pdf",
+            "--codigo-uc",
+            "7",
+            "--codigo-fatura",
+            "a&b=1",
+            "--output",
+            flag_pdf.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(fs::read(&flag_pdf).unwrap().starts_with(b"%PDF-"));
     let state = dir.path().join("open.jsonl");
     let out = run(
         &[
@@ -648,7 +678,44 @@ fn cli_end_to_end_local_only_with_fake_credentials() {
         serde_json::from_slice::<Value>(&out.stdout).unwrap()["count"],
         0
     );
-    // Writes: preview, then the identical call with its id and confirm.
+    // Writes from flags: preview, then the identical call with its id and --confirm.
+    let out = run(&["request-other-service", "--body", r#"{"b":2}"#], "");
+    let preview: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(preview["sent"], false);
+    assert!(m.posts.lock().unwrap().is_empty());
+    let id = preview["preview_id"].as_str().unwrap();
+    let out = run(
+        &[
+            "request-other-service",
+            "--body",
+            r#"{"b":3}"#,
+            "--confirm",
+            "--preview-id",
+            id,
+        ],
+        "",
+    );
+    assert!(!out.status.success(), "a changed body must be refused");
+    assert!(m.posts.lock().unwrap().is_empty());
+    let out = run(
+        &[
+            "request-other-service",
+            "--body",
+            r#"{"b":2}"#,
+            "--confirm",
+            "--preview-id",
+            id,
+        ],
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(m.posts.lock().unwrap().len(), 1);
+    m.posts.lock().unwrap().clear();
+    // Writes from stdin: preview, then the identical call with its id and confirm.
     let out = run(&["tool", "request_other_service"], r#"{"body":{"a":1}}"#);
     let preview: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(preview["sent"], false);
@@ -782,5 +849,60 @@ fn output_replaces_symlink_without_following_and_state_remains_private() {
     assert_eq!(
         fs::metadata(&output).unwrap().permissions().mode() & 0o777,
         0o600
+    );
+}
+
+#[test]
+fn every_operation_has_a_flag_command_and_stdin_tool_still_works() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let bin = env!("CARGO_BIN_EXE_cooperalianca");
+    let listed: Vec<Value> =
+        serde_json::from_slice(&Command::new(bin).arg("tools").output().unwrap().stdout).unwrap();
+    assert_eq!(listed.len(), catalog::OPS.len() + 1);
+    for t in &listed {
+        let command = t["command"].as_str().unwrap();
+        if command == "check-new-bills" {
+            continue;
+        }
+        assert!(
+            Command::new(bin)
+                .args([command, "--help"])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "{command}"
+        );
+        // Each documented flag exists on the command.
+        let help = String::from_utf8(
+            Command::new(bin)
+                .args([command, "--help"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        for flag in t["flags"].as_object().unwrap().values() {
+            let flag = flag.as_str().unwrap().split_whitespace().next().unwrap();
+            assert!(help.contains(flag), "{command} lacks {flag}");
+        }
+    }
+    let mut child = Command::new(bin)
+        .args(["--offline", "tool", "request_other_service"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"body":{"a":1}}"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["sent"],
+        false
     );
 }

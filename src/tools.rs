@@ -9,6 +9,10 @@ use sha2::{Digest, Sha256};
 #[derive(Serialize, Debug)]
 pub struct Tool {
     pub name: &'static str,
+    /// The CLI subcommand that runs this tool with flags instead of stdin JSON.
+    pub command: String,
+    /// Tool input name to CLI flag.
+    pub flags: Value,
     pub description: &'static str,
     pub input_schema: Value,
     pub output_schema: Value,
@@ -27,6 +31,39 @@ pub struct PdfInfo {
     pub size_bytes: usize,
     pub sha256: String,
     pub content_type: String,
+}
+/// `codigoUc` and `CodigoUC` both become `codigo-uc`; underscores become dashes.
+pub fn kebab(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '_' {
+            out.push('-');
+            continue;
+        }
+        if c.is_uppercase() && i > 0 {
+            let prev = chars[i - 1];
+            let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            if prev.is_lowercase() || prev.is_ascii_digit() || (prev.is_uppercase() && next_lower) {
+                out.push('-');
+            }
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+pub fn op_flags(op: &Op) -> Vec<&'static str> {
+    let mut f: Vec<&'static str> = op
+        .path_params
+        .iter()
+        .chain(op.query)
+        .chain(op.optional_query)
+        .copied()
+        .collect();
+    if op.body {
+        f.push("body");
+    }
+    f
 }
 fn string_or_int() -> Value {
     json!({"type":["string","integer"]})
@@ -66,8 +103,31 @@ fn op_schema(op: &Op) -> Value {
 }
 fn tool_for(op: &'static Op) -> Tool {
     let changes = op.kind != Kind::Read;
+    let mut flags = Map::new();
+    for p in op_flags(op) {
+        flags.insert(p.into(), json!(format!("--{}", kebab(p))));
+    }
+    if op.body {
+        flags.insert("body".into(), json!("--body <JSON> or --body-file <PATH>"));
+    }
+    if changes {
+        flags.insert("confirm".into(), json!("--confirm"));
+        flags.insert("preview_id".into(), json!("--preview-id"));
+    }
+    if op.kind == Kind::Destructive {
+        flags.insert("target".into(), json!("--target"));
+        flags.insert("restated_target".into(), json!("--restated-target"));
+    }
+    if op.out == Out::Pdf {
+        flags.insert(
+            "output".into(),
+            json!("--output <PATH> (CLI only; saves the PDF privately)"),
+        );
+    }
     Tool {
         name: op.name,
+        command: kebab(op.name),
+        flags: Value::Object(flags),
         description: op.help,
         input_schema: op_schema(op),
         output_schema: if op.out == Out::Pdf {
@@ -90,6 +150,8 @@ pub fn tools() -> Vec<Tool> {
     let mut all: Vec<Tool> = catalog::OPS.iter().map(tool_for).collect();
     all.push(Tool {
         name: "check_new_bills",
+        command: "check-new-bills".into(),
+        flags: json!({"codigoUc":"--uc","previous":"--state <PATH>","update_state":"--update-state"}),
         description: "Fetch a unit's open invoices and return rows not present in previous.",
         input_schema: json!({"type":"object","additionalProperties":false,"properties":{"codigoUc":string_or_int(),"previous":{"type":"array"}},"required":["codigoUc"]}),
         output_schema: json!({"type":"object","properties":{"new_bills":{"type":"array"},"count":{"type":"integer"}},"required":["new_bills","count"]}),

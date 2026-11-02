@@ -129,39 +129,51 @@ This clears local state; it does not claim to revoke sessions on the server.
 
 ## AI agent tools
 
+Every portal operation is its own command with flags, so an agent can run it
+without piping input. Flags are the portal's own parameter names in kebab-case.
+`cooperalianca tools` lists every operation with its schema, command, and flags:
+
 ```sh
 cooperalianca tools
 cooperalianca unmapped
+cooperalianca open-invoices --codigo-uc 123 \
+  --store-dir /absolute/private/path/cooperalianca-store
+cooperalianca list-invoices-by-year --codigo-uc 123 --titularidade 1 --ano 2025
+```
+
+The same operations run from JSON on stdin with `tool <name>`, which also
+fits hosts that call tools programmatically. Both forms share one
+implementation and one schema:
+
+```sh
 printf '%s\n' '{"codigoUc":123}' | cooperalianca tool open_invoices \
   --store-dir /absolute/private/path/cooperalianca-store
 ```
 
-Every tool takes one strict JSON object (unknown fields are rejected) and
-reports its schema in `tools`. Parameter names are the portal's own. Reads
-return the portal's `Content` unchanged, because the portal's response shapes
-are not documented. Numbers keep full precision.
+Every input is strict (unknown fields are rejected). Reads return the
+portal's `Content` unchanged, because the portal's response shapes are not
+documented. Numbers keep full precision.
 
 Operations that change portal state take a body exactly as the web app sends
-it, and work in two steps: call without `confirm` for a preview that sends
-nothing, then repeat the identical call with `confirm: true` and the returned
-`preview_id`. A changed payload is refused. Cancellations and removals
-(`unlink_unit`, `cancel_agreement`, `request_contract_termination`,
-`deactivate_account`) also need `target` and an identical `restated_target`.
-The host remains responsible for obtaining the account holder's consent.
+it (`--body '<json>'` or `--body-file <path>`), and work in two steps: run
+without `--confirm` for a preview that sends nothing, then repeat the identical
+command with `--confirm --preview-id <id>`. A changed payload is refused.
+Cancellations and removals (`unlink-unit`, `cancel-agreement`,
+`request-contract-termination`, `deactivate-account`) also need `--target` and
+an identical `--restated-target`. The host remains responsible for obtaining
+the account holder's consent.
 
 ```sh
-printf '%s\n' '{"body":{"Descricao":"example"}}' | cooperalianca tool request_other_service \
-  --store-dir /absolute/private/path/cooperalianca-store
-printf '%s\n' '{"body":{"Descricao":"example"},"confirm":true,"preview_id":"<from the preview>"}' \
-  | cooperalianca tool request_other_service --store-dir /absolute/private/path/cooperalianca-store
+cooperalianca request-other-service --body '{"Descricao":"example"}'
+cooperalianca request-other-service --body '{"Descricao":"example"}' \
+  --confirm --preview-id '<from the preview>'
 ```
 
 Document operations return size and SHA-256; `--output` also saves the PDF
 privately:
 
 ```sh
-printf '%s\n' '{"codigoUc":123,"codigoFatura":456}' | cooperalianca tool invoice_pdf \
-  --output ./fatura.pdf --store-dir /absolute/private/path/cooperalianca-store
+cooperalianca invoice-pdf --codigo-uc 123 --codigo-fatura 456 --output ./fatura.pdf
 ```
 
 `check-new-bills` compares a unit's open invoices with the rows saved in a
